@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+.env
+.env.*
+
+# Local outputs
+out/
+*.png
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Never commit cluster credentials
+kubeconfig
+*.kubeconfig

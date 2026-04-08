@@ -1,0 +1,153 @@
+## 目标
+监控一个应用从“点击安装”到“最终可访问 / `Running`”之间的**每一个阶段**与**每一个容器关键步骤**的耗时，并把数据导出为 `JSON/CSV`，用于后续针对性优化安装速度。
+
+本目录提供一个可直接运行的采集脚本：`collect_install_timeline.py`。
+也提供一个实时监控脚本：`watch_install_live.py`（终端 UI）。
+
+## 你将得到什么
+- **阶段级耗时（AppManager 状态机）**：`Pending -> Downloading -> Installing -> Initializing -> Running`
+- **Pod 级耗时**：
+  - 调度：`PodScheduled`
+  - 拉镜像：从 event `Pulling` 到 `Pulled`（以及 ImagePullBackOff 等失败原因）
+  - 创建/启动：`Created` / `Started`
+  - 就绪：Pod `Ready=True` 的时间点
+- **容器级耗时**：
+  - `containerStatuses[*].state.running.startedAt`（容器实际进入 running 的时间）
+  - `containerStatuses[*].ready` 变化（配合 Pod Ready 时间）
+
+> 说明：Kubernetes 事件与状态字段在不同集群/运行时可能略有差异；脚本会尽量兼容，并在缺失时给出空值。
+
+## 安装依赖
+建议用 venv：
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r speed/requirements.txt
+```
+
+## 运行方式
+你需要能访问集群（`~/.kube/config` 或集群内 serviceaccount）。
+
+### 实时监控（终端 UI）
+实时刷新 `ApplicationManager` 状态与 Pod/容器关键进度，适合你边安装边看“卡在哪里”。
+
+#### 只提供应用名（可在安装前启动）
+脚本会先进入“arming”状态，等待该应用的 `ApplicationManager(InstallOp)` 出现；一旦出现会自动拿到 `namespace/owner` 并开始展示详细耗时。
+
+```bash
+python speed/watch_install_live.py \
+  --app <app-name> \
+  --refresh 1.0 \
+  --until-running
+```
+
+#### 直接提供 appmgr（立即开始）
+```bash
+python speed/watch_install_live.py \
+  --appmgr <applicationmanager-name> \
+  --refresh 1.0 \
+  --until-running
+```
+
+> 终端 UI 里会额外显示：
+> - `ApplicationManager` 状态切换的阶段时间线（enter 时间与已耗时）
+> - 阶段耗时占比“饼图”（终端字符画 + legend）
+> - **Combined Share**：`ApplicationManager` 各阶段 + `Pod Σ Sched / Σ Pull / Σ Start→Ready` 合在一张饼图里（相对占比，各段可能时间重叠，见界面脚注）
+> - 每个 Pod 的 `Sched/Pull/Start->Ready` 耗时
+> - 每个 Pod 的最新告警事件（例如 `FailedScheduling/ImagePullBackOff/BackOff/CrashLoopBackOff`）及持续时间
+> - 每个容器的 `Pull(+)`、`Created/Started` 事件时间、`startedAt`、`waiting reason`、重启次数等
+
+### 方式 A：按 ApplicationManager 名称采集（推荐）
+`app-service` 会创建 `ApplicationManager` CR，脚本会以它为主线串起整条安装链路。
+
+```bash
+python speed/collect_install_timeline.py \
+  --appmgr <applicationmanager-name> \
+  --namespace <app-namespace> \
+  --out speed/out/<name>.json
+```
+
+### 方式 B：按 app + owner 推断 appmgr 名称
+如果你更像是“从点击安装”开始对齐，可以用 `app`/`owner` 来推断名字（实际命名规则可能因版本不同而变化，脚本会尝试常见规则并回退提示）。
+
+```bash
+python speed/collect_install_timeline.py \
+  --app <app-name> \
+  --owner <username> \
+  --namespace <app-namespace> \
+  --out speed/out/<app>.json
+```
+
+### 导出 CSV（便于画瀑布图）
+
+```bash
+python speed/collect_install_timeline.py ... --csv speed/out/<name>.csv
+```
+
+### 生成饼图（每个阶段耗时占比）
+从采集到的 `ApplicationManager` 阶段耗时生成饼图 PNG。
+
+```bash
+python speed/collect_install_timeline.py \
+  --appmgr <applicationmanager-name> \
+  --namespace <app-namespace> \
+  --out speed/out/<name>.json \
+  --pie speed/out/<name>_phases.png
+```
+
+## 输出字段说明（简版）
+- **`appmgr.phases[]`**：每个状态的 `enter_time` 与 `duration_seconds`
+- **`pods[]`**：每个 Pod 的调度/拉镜像/启动/就绪时间点与耗时
+- **`containers[]`**：容器 `startedAt` 与所属 Pod
+- **`bottlenecks[]`**：脚本基于简单规则给出的“可能瓶颈点”
+
+## 如何用这些数据做优化（建议清单）
+- **Downloading 很慢**：镜像拉取/解包慢
+  - 近端 registry / mirror、预拉取、镜像瘦身、多架构镜像策略
+  - 并行拉取与复用层（镜像 tag/层稳定）
+- **PodScheduled 慢**：调度/资源不足
+  - 资源 requests/limits 过大、节点选择/亲和性、GPU/特殊资源约束
+  - 优化 Chart 默认资源、延迟启动非关键组件、拆分大 Pod
+- **Pulling->Pulled 慢**：镜像大或网络慢
+  - 镜像分层优化、减少大层、使用更快的存储/网络、启用节点镜像缓存
+- **Started->Ready 慢**：应用启动慢 / 探针过严 / 初始化逻辑耗时
+  - readinessProbe 优化、启动参数与缓存、避免阻塞 init、减少冷启动依赖
+- **Installing 阶段很长**：Helm/CRD/Job 执行慢
+  - 检查 chart hooks、CRD 安装、依赖中间件初始化、减少串行步骤
+
+## 独立仓库：推送到 GitHub（公开）
+
+在**本机** `speed/` 目录已初始化 Git 后，在 GitHub 新建 **空** 的 public 仓库（不要勾选添加 README），然后：
+
+```bash
+cd speed
+git remote add origin https://github.com/<你的用户名>/<仓库名>.git
+git branch -M main
+git push -u origin main
+```
+
+## 远端宿主机上使用（克隆后）
+
+假设仓库克隆到 `~/olares-install-speed`，且该机器已能访问 Kubernetes API（`~/.kube/config` 已配置好）：
+
+```bash
+git clone https://github.com/<你的用户名>/<仓库名>.git ~/olares-install-speed
+cd ~/olares-install-speed
+
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+# 实时监控（安装前可启动，仅应用名）
+python watch_install_live.py --app <app-name> --refresh 1.0 --until-running
+
+# 事后采集 JSON + 饼图 PNG
+python collect_install_timeline.py \
+  --appmgr <applicationmanager-name> \
+  --namespace <app-namespace> \
+  --out ./out/timeline.json \
+  --pie ./out/phases.png \
+  --csv ./out/timeline.csv
+```
+
