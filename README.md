@@ -23,7 +23,7 @@
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r speed/requirements.txt
+pip install -r requirements.txt
 ```
 
 ## 运行方式
@@ -33,18 +33,24 @@ pip install -r speed/requirements.txt
 实时刷新 `ApplicationManager` 状态与 Pod/容器关键进度，适合你边安装边看“卡在哪里”。
 
 #### 只提供应用名（可在安装前启动）
-脚本会先进入“arming”状态，等待该应用的 `ApplicationManager(InstallOp)` 出现；一旦出现会自动拿到 `namespace/owner` 并开始展示详细耗时。
+脚本会先尝试匹配「**本进程启动之后**」才发生的安装（`ApplicationManager` 的 `opTime/statusTime` 晚于启动时间）。若应用**已经处于 Running**、没有新的安装事件，默认会**自动挂到该应用最新的 `ApplicationManager`** 上并继续展示（否则会一直等，看起来像无输出）。
+
+若你只想等**全新一次安装**（例如在已有 CR 的机器上重装），请加上：
 
 ```bash
-python speed/watch_install_live.py \
-  --app <app-name> \
-  --refresh 1.0 \
-  --until-running
+python watch_install_live.py --app <app-name> --wait-new-install --refresh 1.0
+```
+
+Web 控制台等**非 TTY** 终端里 Rich 可能不刷新界面，可尝试：
+
+```bash
+export FORCE_TERMINAL_UI=1
+python watch_install_live.py --app <app-name> --refresh 1.0 --until-running
 ```
 
 #### 直接提供 appmgr（立即开始）
 ```bash
-python speed/watch_install_live.py \
+python watch_install_live.py \
   --appmgr <applicationmanager-name> \
   --refresh 1.0 \
   --until-running

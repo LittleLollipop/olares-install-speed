@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -12,7 +13,7 @@ try:
     from kubernetes import client, config
 except Exception as e:
     print(f"ERROR: failed to import kubernetes python client: {e}", file=sys.stderr)
-    print("Install deps: pip install -r speed/requirements.txt", file=sys.stderr)
+    print("Install deps: pip install -r requirements.txt", file=sys.stderr)
     raise
 
 try:
@@ -23,7 +24,7 @@ try:
     from rich.style import Style
 except Exception as e:
     print(f"ERROR: failed to import rich: {e}", file=sys.stderr)
-    print("Install deps: pip install -r speed/requirements.txt", file=sys.stderr)
+    print("Install deps: pip install -r requirements.txt", file=sys.stderr)
     raise
 
 
@@ -106,6 +107,41 @@ def guess_appmgr_name(app: str, owner: str, namespace: str) -> List[str]:
         f"{app}-{namespace}-{owner}",
     ]
 
+
+def _appmgr_sort_time(am: Dict[str, Any]) -> Optional[datetime]:
+    status = am.get("status") or {}
+    t_str = status.get("opTime") or status.get("statusTime") or status.get("updateTime")
+    t = parse_ts(t_str) if isinstance(t_str, str) else None
+    if not t:
+        ct = (am.get("metadata") or {}).get("creationTimestamp")
+        t = parse_ts(ct) if isinstance(ct, str) else None
+    return t
+
+
+def pick_latest_appmgr_for_app(co: client.CustomObjectsApi, app: str) -> Optional[Tuple[str, str, Optional[str]]]:
+    """Latest ApplicationManager for spec.appName == app (by status/update time)."""
+    best: Optional[Tuple[datetime, str, str, str]] = None
+    for am in list_appmgrs(co):
+        spec = am.get("spec") or {}
+        if str(spec.get("appName") or "") != app:
+            continue
+        t = _appmgr_sort_time(am)
+        if not t:
+            continue
+        name = str(((am.get("metadata") or {}).get("name")) or "")
+        ns = str(((am.get("spec") or {}).get("appNamespace")) or "")
+        if not name or not ns:
+            continue
+        am_owner = str(((am.get("spec") or {}).get("appOwner")) or "")
+        cand = (t, name, ns, am_owner)
+        if best is None or t > best[0]:
+            best = cand
+    if not best:
+        return None
+    _, name, ns, am_owner = best
+    return name, ns, (am_owner or None)
+
+
 def pick_appmgr_or_wait(
     co: client.CustomObjectsApi,
     appmgr: Optional[str],
@@ -114,6 +150,7 @@ def pick_appmgr_or_wait(
     namespace: Optional[str],
     arm_start: datetime,
     refresh: float,
+    wait_new_install: bool,
 ) -> Tuple[str, str, Optional[str]]:
     if appmgr:
         am = get_custom_object(co, appmgr)
@@ -135,7 +172,9 @@ def pick_appmgr_or_wait(
             except Exception:
                 pass
 
-    # Arming mode: start before install, wait for newest matching install op.
+    # Arming mode: prefer an install that started after this process (t >= arm_start).
+    # If the app is already Running and nothing matches, attach to the latest ApplicationManager (--wait-new-install disables this).
+    wait_log = 0.0
     while True:
         best: Optional[Tuple[datetime, Dict[str, Any]]] = None
         for am in list_appmgrs(co):
@@ -146,11 +185,7 @@ def pick_appmgr_or_wait(
             if str(spec.get("opType") or "") != OPTYPE_INSTALL and str(status.get("opType") or "") != OPTYPE_INSTALL:
                 continue
 
-            t_str = status.get("opTime") or status.get("statusTime") or status.get("updateTime")
-            t = parse_ts(t_str) if isinstance(t_str, str) else None
-            if not t:
-                ct = (am.get("metadata") or {}).get("creationTimestamp")
-                t = parse_ts(ct) if isinstance(ct, str) else None
+            t = _appmgr_sort_time(am)
             if not t or t < arm_start:
                 continue
 
@@ -163,7 +198,30 @@ def pick_appmgr_or_wait(
             ns = str(((am.get("spec") or {}).get("appNamespace")) or (namespace or ""))
             am_owner = str(((am.get("spec") or {}).get("appOwner")) or (owner or ""))
             if name and ns:
+                print(
+                    f"[install-speed] Using ApplicationManager created/updated after script start: {name} ns={ns}",
+                    file=sys.stderr,
+                )
                 return name, ns, (am_owner or None)
+
+        if not wait_new_install:
+            fb = pick_latest_appmgr_for_app(co, app)
+            if fb:
+                name, ns, am_owner = fb
+                print(
+                    f"[install-speed] No install started after this process; attaching to latest ApplicationManager: "
+                    f"{name} ns={ns}. (Use --wait-new-install to only wait for a fresh install.)",
+                    file=sys.stderr,
+                )
+                return name, ns, am_owner
+
+        if time.time() - wait_log >= 5.0:
+            wait_log = time.time()
+            print(
+                f"[install-speed] Waiting for ApplicationManager for app={app!r} with install activity after script start... "
+                f"(already Running? omit --wait-new-install to attach to existing, or pass --appmgr NAME)",
+                file=sys.stderr,
+            )
 
         time.sleep(refresh)
 
@@ -799,12 +857,25 @@ def main() -> int:
     ap.add_argument("--owner", help="Owner username (optional, improves pod filtering)")
     ap.add_argument("--refresh", type=float, default=1.0, help="Refresh interval seconds (default 1.0)")
     ap.add_argument("--until-running", action="store_true", help="Exit when appmgr state becomes Running")
+    ap.add_argument(
+        "--wait-new-install",
+        action="store_true",
+        help="With --app only: do not attach to an existing ApplicationManager; wait for an install whose op time is after this process started",
+    )
     args = ap.parse_args()
 
     load_kube_config()
     co = client.CustomObjectsApi()
     v1 = client.CoreV1Api()
-    console = Console()
+    use_ft = sys.stdout.isatty()
+    if os.environ.get("FORCE_TERMINAL_UI", "").lower() in ("1", "true", "yes"):
+        use_ft = True
+    if not sys.stdout.isatty():
+        print(
+            "Note: stdout is not a TTY; if the UI is blank, try: export FORCE_TERMINAL_UI=1",
+            file=sys.stderr,
+        )
+    console = Console(force_terminal=use_ft)
 
     try:
         arm_start = now_utc()
@@ -816,6 +887,7 @@ def main() -> int:
             namespace=args.namespace,
             arm_start=arm_start,
             refresh=args.refresh,
+            wait_new_install=args.wait_new_install,
         )
         if not args.owner and detected_owner:
             args.owner = detected_owner
