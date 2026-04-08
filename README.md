@@ -151,3 +151,33 @@ python collect_install_timeline.py \
   --csv ./out/timeline.csv
 ```
 
+### Debian / Ubuntu：`ensurepip is not available` / 无法创建 venv
+
+系统自带的 Python 常**不带** `venv` 模块，需要先装（版本号与 `python3 --version` 一致，例如 3.12 则用 `python3.12-venv`）：
+
+```bash
+sudo apt update
+sudo apt install -y python3-venv
+# 若仍报错，按提示安装对应版本，例如：
+# sudo apt install -y python3.12-venv
+```
+
+然后删掉失败留下的目录并重建：
+
+```bash
+cd ~/olares-install-speed
+rm -rf .venv
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+**不打算用 venv 时**（仅当前用户 / root 全局依赖），可：
+
+```bash
+sudo apt update
+sudo apt install -y python3-pip
+pip3 install --user -r requirements.txt
+# 运行：python3 watch_install_live.py ...
+```
+
