@@ -56,7 +56,7 @@ python watch_install_live.py --app <app-name> --refresh 1.0 --until-running
 - `--pie full`：三大饼：阶段 | 按 Pod | 按容器 pull  
 - `--pie off`：三张百分比表，无条形图  
 - `--share-bar-width N`：条形字符宽度（默认 28）  
-- `--alt-screen`：`Live` 用终端**备用屏幕**（常能占满整窗高度，适合 Web/IDE 终端里「上面空一截」的情况）  
+- 默认可交互终端上会**清屏并进入备用屏幕**（独立缓冲区，从第 1 行占满高度，退出后恢复原屏幕）；不需要时用 `--no-alt-screen`  
 - `--live-overflow`：`crop` / `ellipsis` / `visible`（仍装不下可 `--pie off`、拉高窗口或 `--share-max-rows 6`）
 
 #### 直接提供 appmgr（立即开始）
@@ -69,7 +69,7 @@ python watch_install_live.py \
 
 > 终端 UI 里会额外显示：
 > - `ApplicationManager` 状态切换的阶段时间线（enter 时间与已耗时）
-> - 阶段 / 按 Pod / 按容器 pull：**三套独立 100%**（多 Pod、多容器时看谁耗时更大）；`--pie` / `--share-bar-width` / `--alt-screen` / `--live-overflow` 可调显示方式
+> - 阶段 / 按 Pod / 按容器 pull：**三套独立 100%**（多 Pod、多容器时看谁耗时更大）；`--pie` / `--share-bar-width` / `--no-alt-screen` / `--live-overflow` 可调显示方式
 > - 每个 Pod 的 `Sched/Pull/Start->Ready` 耗时（若常见 workload label 对不上 `--app`，会自动按 Pod 名包含应用名、再不行则列出 `spec.appNamespace` 下全部 Pod，并有一行灰色说明）
 > - 每个 Pod 的最新告警事件（例如 `FailedScheduling/ImagePullBackOff/BackOff/CrashLoopBackOff`）及持续时间
 > - 每个容器的 `Pull(+)`、`Created/Started` 事件时间、`startedAt`、`waiting reason`、重启次数等

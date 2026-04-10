@@ -1371,9 +1371,9 @@ def main() -> int:
         help="Rich Live when output exceeds terminal height: crop=show top lines only (default); ellipsis=last line '...'; visible=full height (may not clear cleanly while refreshing)",
     )
     ap.add_argument(
-        "--alt-screen",
+        "--no-alt-screen",
         action="store_true",
-        help="Draw Live on the terminal alternate screen (uses full window height from top; good for web/IDE terminals)",
+        help="Do not use the terminal alternate screen (default: use it on a real TTY so Live gets a full-height buffer from row 1)",
     )
     args = ap.parse_args()
 
@@ -1420,11 +1420,15 @@ def main() -> int:
     pod_event_cache: Dict[str, Dict[str, Any]] = {}
     phase_tracker: List[Tuple[str, datetime]] = []
 
+    use_alt_screen = bool(console.is_terminal and not args.no_alt_screen)
+    if use_alt_screen:
+        console.clear()
+
     with Live(
         console=console,
         refresh_per_second=max(1, int(1 / max(0.1, args.refresh))),
         vertical_overflow=args.live_overflow,
-        screen=args.alt_screen,
+        screen=use_alt_screen,
     ) as live:
         while True:
             try:
