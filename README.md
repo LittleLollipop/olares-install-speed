@@ -50,6 +50,11 @@ export FORCE_TERMINAL_UI=1
 python watch_install_live.py --app <app-name> --refresh 1.0 --until-running
 ```
 
+饼图默认改为**紧凑**：同一行里放两个小号饼图（`--pie compact`，默认）。一屏要更多信息可用：
+
+- `--pie off`：只显示百分比表，不占圆形图高度  
+- `--pie full`：恢复原先两行大号饼图  
+
 #### 直接提供 appmgr（立即开始）
 ```bash
 python watch_install_live.py \
@@ -60,8 +65,7 @@ python watch_install_live.py \
 
 > 终端 UI 里会额外显示：
 > - `ApplicationManager` 状态切换的阶段时间线（enter 时间与已耗时）
-> - 阶段耗时占比“饼图”（终端字符画 + legend）
-> - **Combined Share**：`ApplicationManager` 各阶段 + `Pod Σ Sched / Σ Pull / Σ Start→Ready` 合在一张饼图里（相对占比，各段可能时间重叠，见界面脚注）
+> - 阶段 / 合并占比：默认**紧凑**双饼一行；可用 `--pie off` / `--pie full` 调整
 > - 每个 Pod 的 `Sched/Pull/Start->Ready` 耗时
 > - 每个 Pod 的最新告警事件（例如 `FailedScheduling/ImagePullBackOff/BackOff/CrashLoopBackOff`）及持续时间
 > - 每个容器的 `Pull(+)`、`Created/Started` 事件时间、`startedAt`、`waiting reason`、重启次数等

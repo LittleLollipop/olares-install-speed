@@ -574,7 +574,7 @@ def render_phase_table(tracker: List[Tuple[str, datetime]]) -> Table:
     t.add_column("Enter(UTC)")
     t.add_column("Duration", justify="right")
     now = now_utc()
-    for i, (st, enter) in enumerate(tracker[-12:]):
+    for i, (st, enter) in enumerate(tracker[-8:]):
         exit_t = tracker[i + 1][1] if i + 1 < len(tracker) else None
         dur = dur_s(enter, exit_t or now)
         t.add_row(st, dt_to_iso(enter), fmt_dur(dur))
@@ -647,11 +647,56 @@ def build_combined_pie_slices(
     return out
 
 
+def _merge_pie_slices(durs: List[Tuple[str, float]]) -> Tuple[List[Tuple[str, float]], float]:
+    total = sum(d for _, d in durs)
+    merged: List[Tuple[str, float]] = []
+    other = 0.0
+    for s, d in durs:
+        if d / total < 0.03:
+            other += d
+        else:
+            merged.append((s, d))
+    if other > 0:
+        merged.append(("Other", other))
+    total_m = sum(d for _, d in merged)
+    return merged, total_m
+
+
+def render_share_legend_table(
+    raw_slices: List[Tuple[str, float]],
+    title: Optional[str],
+    empty_msg: str,
+    max_rows: int = 12,
+) -> Table:
+    """Percentage table only (no ASCII pie) — minimal vertical space."""
+    durs = [(s, d) for s, d in raw_slices if d > 0.001]
+    tbl_kw: Dict[str, Any] = {"show_header": True, "header_style": "bold", "box": None}
+    if title:
+        tbl_kw["title"] = title
+    t = Table(**tbl_kw)
+    t.add_column("Step", overflow="fold")
+    t.add_column("%", justify="right")
+    t.add_column("s", justify="right")
+    if not durs:
+        t.add_row(Text(empty_msg, style="dim"), "-", "-")
+        return t
+    merged, total = _merge_pie_slices(durs)
+    for i, (s, d) in enumerate(merged[:max_rows]):
+        color = PIE_PALETTE[i % len(PIE_PALETTE)]
+        pct = (d / total) * 100 if total > 0 else 0.0
+        t.add_row(Text(s, style=Style(color=color)), f"{pct:.1f}", f"{d:.0f}")
+    if len(merged) > max_rows:
+        t.add_row(Text("…", style="dim"), "", "")
+    return t
+
+
 def render_pie_chart(
     raw_slices: List[Tuple[str, float]],
     legend_first_col: str,
     empty_msg: str,
     footnote: Optional[str] = None,
+    radius: int = 4,
+    max_legend_rows: int = 16,
 ) -> Table:
     """
     Terminal pie chart from (label, seconds) slices.
@@ -665,17 +710,7 @@ def render_pie_chart(
         t.add_row(Text(empty_msg, style="dim"))
         return t
 
-    total = sum(d for _, d in durs)
-    merged: List[Tuple[str, float]] = []
-    other = 0.0
-    for s, d in durs:
-        if d / total < 0.03:
-            other += d
-        else:
-            merged.append((s, d))
-    if other > 0:
-        merged.append(("Other", other))
-    total = sum(d for _, d in merged)
+    merged, total = _merge_pie_slices(durs)
 
     slices_angles: List[Tuple[str, float, float, str]] = []
     acc = 0.0
@@ -687,7 +722,7 @@ def render_pie_chart(
         color = PIE_PALETTE[i % len(PIE_PALETTE)]
         slices_angles.append((s, start, end, color))
 
-    r = 8
+    r = max(3, min(radius, 10))
     y_scale = 0.5
     pie = Text()
     for y in range(-r, r + 1):
@@ -715,12 +750,14 @@ def render_pie_chart(
     legend = Table(show_header=True, header_style="bold", box=None)
     legend.add_column(legend_first_col)
     legend.add_column("%", justify="right")
-    legend.add_column("Seconds", justify="right")
-    for i, (s, d) in enumerate(merged):
+    legend.add_column("s", justify="right")
+    for i, (s, d) in enumerate(merged[:max_legend_rows]):
         color = PIE_PALETTE[i % len(PIE_PALETTE)]
         pct = (d / total) * 100 if total > 0 else 0.0
         label = Text(s, style=Style(color=color))
-        legend.add_row(label, f"{pct:.1f}", f"{d:.1f}")
+        legend.add_row(label, f"{pct:.1f}", f"{d:.0f}")
+    if len(merged) > max_legend_rows:
+        legend.add_row(Text("…", style="dim"), "", "")
 
     inner = Table(box=None)
     inner.add_column("Pie")
@@ -737,12 +774,18 @@ def render_pie_chart(
     return outer
 
 
-def render_phase_pie(tracker: List[Tuple[str, datetime]]) -> Table:
+def render_phase_pie(
+    tracker: List[Tuple[str, datetime]],
+    radius: int = 4,
+    max_legend_rows: int = 16,
+) -> Table:
     return render_pie_chart(
         phase_durations_seconds(tracker),
         "Phase",
         "no phase durations yet",
         footnote=None,
+        radius=radius,
+        max_legend_rows=max_legend_rows,
     )
 
 
@@ -751,14 +794,86 @@ def render_combined_pie(
     pods: List[client.V1Pod],
     pod_event_cache: Dict[str, Dict[str, Any]],
     started_at: datetime,
+    radius: int = 4,
+    max_legend_rows: int = 16,
+    footnote: Optional[str] = (
+        "Combined: AppManager phases + Pod Σ(Sched/Pull/Start→Ready). Buckets may overlap in real time; use as relative weight."
+    ),
 ) -> Table:
     slices = build_combined_pie_slices(tracker, pods, pod_event_cache, started_at)
     return render_pie_chart(
         slices,
         "Step",
         "no combined data yet",
-        footnote="Combined: AppManager phases + Pod Σ(Sched/Pull/Start→Ready). Buckets may overlap in real time; use as relative weight.",
+        footnote=footnote,
+        radius=radius,
+        max_legend_rows=max_legend_rows,
     )
+
+
+def render_share_compact_row(
+    phase_tracker: List[Tuple[str, datetime]],
+    pods: List[client.V1Pod],
+    pod_event_cache: Dict[str, Dict[str, Any]],
+    started_at: datetime,
+) -> Table:
+    """Single row: two small pies side-by-side + one footnote line (saves vertical space)."""
+    row = Table(box=None)
+    row.add_column("Phase")
+    row.add_column("Combined")
+    row.add_row(
+        render_phase_pie(phase_tracker, radius=4, max_legend_rows=8),
+        render_combined_pie(
+            phase_tracker,
+            pods,
+            pod_event_cache,
+            started_at,
+            radius=4,
+            max_legend_rows=8,
+            footnote=None,
+        ),
+    )
+    wrap = Table(box=None, show_header=False)
+    wrap.add_column("block")
+    wrap.add_row(row)
+    wrap.add_row(
+        Text(
+            "Combined: phases + Pod Σ(Sched/Pull/Start→Ready); buckets may overlap — relative weight only.",
+            style="dim",
+        )
+    )
+    return wrap
+
+
+def render_share_off_row(
+    phase_tracker: List[Tuple[str, datetime]],
+    pods: List[client.V1Pod],
+    pod_event_cache: Dict[str, Dict[str, Any]],
+    started_at: datetime,
+) -> Table:
+    """Legend tables only, side-by-side — minimal height."""
+    row = Table(box=None)
+    row.add_column("Phase %")
+    row.add_column("Combined %")
+    row.add_row(
+        render_share_legend_table(
+            phase_durations_seconds(phase_tracker),
+            "",
+            "no phase data",
+            max_rows=10,
+        ),
+        render_share_legend_table(
+            build_combined_pie_slices(phase_tracker, pods, pod_event_cache, started_at),
+            "",
+            "no combined data",
+            max_rows=10,
+        ),
+    )
+    wrap = Table(box=None, show_header=False)
+    wrap.add_column("block")
+    wrap.add_row(row)
+    wrap.add_row(Text("Combined buckets may overlap wall-clock.", style="dim"))
+    return wrap
 
 
 def render_container_table(pods: List[client.V1Pod]) -> Table:
@@ -866,6 +981,7 @@ def render(
     pods: List[client.V1Pod],
     pod_event_cache: Dict[str, Dict[str, Any]],
     phase_tracker: List[Tuple[str, datetime]],
+    pie_mode: str = "compact",
 ) -> Table:
     root = Table(title=f"Install Live Monitor  appmgr={appmgr_name}  ns={namespace}", show_lines=False)
     root.add_column("Section", style="bold")
@@ -879,8 +995,16 @@ def render(
     am_line.append(f"message={am_msg}")
     root.add_row("ApplicationManager", am_line)
     root.add_row("Phases", render_phase_table(phase_tracker))
-    root.add_row("Phase Share", render_phase_pie(phase_tracker))
-    root.add_row("Combined Share", render_combined_pie(phase_tracker, pods, pod_event_cache, started_at))
+    if pie_mode == "off":
+        root.add_row("Share", render_share_off_row(phase_tracker, pods, pod_event_cache, started_at))
+    elif pie_mode == "full":
+        root.add_row("Phase Share", render_phase_pie(phase_tracker, radius=8, max_legend_rows=14))
+        root.add_row(
+            "Combined Share",
+            render_combined_pie(phase_tracker, pods, pod_event_cache, started_at, radius=8, max_legend_rows=14),
+        )
+    else:
+        root.add_row("Share", render_share_compact_row(phase_tracker, pods, pod_event_cache, started_at))
 
     pods_tbl = Table(show_header=True, header_style="bold", box=None)
     pods_tbl.add_column("Pod", overflow="fold")
@@ -964,6 +1088,12 @@ def main() -> int:
         "--wait-new-install",
         action="store_true",
         help="With --app only: do not attach to an existing ApplicationManager; wait for an install whose op time is after this process started",
+    )
+    ap.add_argument(
+        "--pie",
+        choices=("compact", "full", "off"),
+        default="compact",
+        help="Share charts: compact=two small pies in one row (default); full=large pies on two rows; off=percent tables only",
     )
     args = ap.parse_args()
 
@@ -1054,7 +1184,21 @@ def main() -> int:
                     "warn": warn,
                 }
 
-            live.update(render(appmgr_name, namespace, am_state, am_progress, am_msg, am_time, started_at, pods, pod_event_cache, phase_tracker))
+            live.update(
+                render(
+                    appmgr_name,
+                    namespace,
+                    am_state,
+                    am_progress,
+                    am_msg,
+                    am_time,
+                    started_at,
+                    pods,
+                    pod_event_cache,
+                    phase_tracker,
+                    pie_mode=args.pie,
+                )
+            )
 
             if args.until_running and am_state.lower() == "running":
                 break
