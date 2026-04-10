@@ -33,7 +33,9 @@ pip install -r requirements.txt
 实时刷新 `ApplicationManager` 状态与 Pod/容器关键进度，适合你边安装边看“卡在哪里”。
 
 #### 只提供应用名（可在安装前启动）
-脚本会先尝试匹配「**本进程启动之后**」才发生的安装（`ApplicationManager` 的 `opTime/statusTime` 晚于启动时间）。若应用**已经处于 Running**、没有新的安装事件，默认会**自动挂到该应用最新的 `ApplicationManager`** 上并继续展示（否则会一直等，看起来像无输出）。
+`ApplicationManager` 是 **Cluster** 资源（`kubectl get applicationmanagers` 不带 `-n`）。脚本列的是全集群的 `ApplicationManager`，再按 **`spec.appName` / `spec.rawAppName`** 匹配（大小写不敏感兜底）。若你环境里有多个用户装同名应用，可加 **`--namespace <spec.appNamespace>`**，只保留「该用户命名空间」下的那条（对应 CR 里的 `spec.appNamespace`，不是 kubeconfig 的默认 ns）。
+
+脚本会先尝试匹配「**本进程启动之后**」才发生的安装（锚点时间取 `creationTimestamp` 与 `opTime/statusTime/updateTime` 的**最大值**，并与启动时间做 **UTC 归一**比较）。若应用**已经处于 Running**、没有新的安装事件，默认会**自动挂到该应用最新的 `ApplicationManager`** 上并继续展示。
 
 若你只想等**全新一次安装**（例如在已有 CR 的机器上重装），请加上：
 

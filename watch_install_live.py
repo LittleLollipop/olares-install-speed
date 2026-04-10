@@ -11,6 +11,7 @@ import re
 
 try:
     from kubernetes import client, config
+    from kubernetes.client import ApiException
 except Exception as e:
     print(f"ERROR: failed to import kubernetes python client: {e}", file=sys.stderr)
     print("Install deps: pip install -r requirements.txt", file=sys.stderr)
@@ -57,6 +58,36 @@ def parse_ts(ts: Optional[str]) -> Optional[datetime]:
     return dtparser.isoparse(ts)
 
 
+def normalize_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """Compare API timestamps reliably (naive vs aware)."""
+    if not dt:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def spec_matches_app(want: str, spec: Dict[str, Any]) -> bool:
+    """Match spec.appName or spec.rawAppName (case-insensitive fallback)."""
+    want_n = (want or "").strip()
+    if not want_n:
+        return False
+    for key in ("appName", "rawAppName"):
+        v = str(spec.get(key) or "").strip()
+        if not v:
+            continue
+        if v == want_n or v.lower() == want_n.lower():
+            return True
+    return False
+
+
+def spec_matches_namespace_filter(filter_ns: Optional[str], spec: Dict[str, Any]) -> bool:
+    """If --namespace is set, require spec.appNamespace to match (user workload namespace)."""
+    if not filter_ns or not str(filter_ns).strip():
+        return True
+    return str(spec.get("appNamespace") or "") == str(filter_ns).strip()
+
+
 def dt_to_iso(dt: Optional[datetime]) -> str:
     if not dt:
         return "-"
@@ -99,6 +130,16 @@ def list_appmgrs(co_api: client.CustomObjectsApi) -> List[Dict[str, Any]]:
     return list(ret.get("items") or [])
 
 
+def list_appmgrs_safe(co_api: client.CustomObjectsApi) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    try:
+        return list_appmgrs(co_api), None
+    except ApiException as e:
+        body = (e.body or b"").decode("utf-8", errors="replace") if isinstance(e.body, (bytes, bytearray)) else str(e.body or "")
+        return [], f"HTTP {e.status} {e.reason}: {body[:500]}"
+    except Exception as e:
+        return [], str(e)
+
+
 def guess_appmgr_name(app: str, owner: str, namespace: str) -> List[str]:
     return [
         f"{app}-{owner}-{namespace}",
@@ -118,25 +159,32 @@ def _appmgr_anchor_time(am: Dict[str, Any]) -> Optional[datetime]:
     meta = am.get("metadata") or {}
     ct = meta.get("creationTimestamp")
     if isinstance(ct, str):
-        t = parse_ts(ct)
+        t = normalize_utc(parse_ts(ct))
         if t:
             times.append(t)
     status = am.get("status") or {}
     for key in ("opTime", "statusTime", "updateTime"):
         t_str = status.get(key)
         if isinstance(t_str, str):
-            t = parse_ts(t_str)
+            t = normalize_utc(parse_ts(t_str))
             if t:
                 times.append(t)
     return max(times) if times else None
 
 
-def pick_latest_appmgr_for_app(co: client.CustomObjectsApi, app: str) -> Optional[Tuple[str, str, Optional[str]]]:
+def pick_latest_appmgr_for_app(
+    co: client.CustomObjectsApi,
+    app: str,
+    filter_namespace: Optional[str],
+) -> Optional[Tuple[str, str, Optional[str]]]:
     """Latest ApplicationManager for spec.appName == app (by status/update time)."""
+    items, _err = list_appmgrs_safe(co)
     best: Optional[Tuple[datetime, str, str, str]] = None
-    for am in list_appmgrs(co):
+    for am in items:
         spec = am.get("spec") or {}
-        if str(spec.get("appName") or "") != app:
+        if not spec_matches_app(app, spec):
+            continue
+        if not spec_matches_namespace_filter(filter_namespace, spec):
             continue
         t = _appmgr_anchor_time(am)
         if not t:
@@ -164,6 +212,7 @@ def pick_appmgr_or_wait(
     arm_start: datetime,
     refresh: float,
     wait_new_install: bool,
+    filter_namespace: Optional[str],
 ) -> Tuple[str, str, Optional[str]]:
     if appmgr:
         am = get_custom_object(co, appmgr)
@@ -186,18 +235,30 @@ def pick_appmgr_or_wait(
                 pass
 
     # Arming mode: prefer an install that started after this process (t >= arm_start).
-    # If the app is already Running and nothing matches, attach to the latest ApplicationManager (--wait-new-install disables this).
+    # ApplicationManager CR is cluster-scoped; --namespace filters spec.appNamespace (user app namespace).
     wait_log = 0.0
+    diag_log = 0.0
+    arm_u = normalize_utc(arm_start) or arm_start
     while True:
+        items, list_err = list_appmgrs_safe(co)
+        if list_err:
+            if time.time() - wait_log >= 5.0:
+                wait_log = time.time()
+                print(f"[install-speed] cannot list applicationmanagers: {list_err}", file=sys.stderr)
+            time.sleep(refresh)
+            continue
+
         best: Optional[Tuple[datetime, Dict[str, Any]]] = None
-        for am in list_appmgrs(co):
+        for am in items:
             spec = am.get("spec") or {}
             status = am.get("status") or {}
-            if str(spec.get("appName") or "") != app:
+            if not spec_matches_app(app, spec):
+                continue
+            if not spec_matches_namespace_filter(filter_namespace, spec):
                 continue
 
             t = _appmgr_anchor_time(am)
-            if not t or t < arm_start:
+            if not t or t < arm_u:
                 continue
 
             # After install finishes, opType may no longer be InstallOp; --wait-new-install must still match.
@@ -221,7 +282,7 @@ def pick_appmgr_or_wait(
                 return name, ns, (am_owner or None)
 
         if not wait_new_install:
-            fb = pick_latest_appmgr_for_app(co, app)
+            fb = pick_latest_appmgr_for_app(co, app, filter_namespace)
             if fb:
                 name, ns, am_owner = fb
                 print(
@@ -233,12 +294,37 @@ def pick_appmgr_or_wait(
 
         if time.time() - wait_log >= 5.0:
             wait_log = time.time()
+            ns_hint = f" spec.appNamespace must equal {filter_namespace!r}" if (filter_namespace or "").strip() else ""
             print(
-                f"[install-speed] Waiting for ApplicationManager spec.appName={app!r} with any timestamp after script start... "
-                f"(check exact name: kubectl get applicationmanagers -o custom-columns=NAME:.metadata.name,APP:.spec.appName ; "
-                f"or omit --wait-new-install / use --appmgr)",
+                f"[install-speed] Waiting: app matches appName/rawAppName {app!r}{ns_hint}, "
+                f"anchor time >= script start ({dt_to_iso(arm_u)}). "
+                f"Tip: kubectl get applicationmanagers -o wide ; or --namespace <user-namespace> ; or --appmgr NAME",
                 file=sys.stderr,
             )
+
+        if wait_new_install and time.time() - diag_log >= 25.0:
+            diag_log = time.time()
+            sample = []
+            for am in items[:15]:
+                sp = am.get("spec") or {}
+                if spec_matches_app(app, sp) and spec_matches_namespace_filter(filter_namespace, sp):
+                    st = sp.get("appName")
+                    raw = sp.get("rawAppName")
+                    ns = sp.get("appNamespace")
+                    nm = (am.get("metadata") or {}).get("name")
+                    ta = _appmgr_anchor_time(am)
+                    sample.append(f"{nm} app={st!r} raw={raw!r} ns={ns!r} anchor={dt_to_iso(ta)}")
+            print(f"[install-speed] cluster ApplicationManagers total={len(items)}", file=sys.stderr)
+            if sample:
+                print("[install-speed] rows matching name/ns filter but anchor < start (or stale):", file=sys.stderr)
+                for line in sample[:10]:
+                    print(f"  {line}", file=sys.stderr)
+            else:
+                ns_part = f" and spec.appNamespace={filter_namespace!r}" if (filter_namespace or "").strip() else ""
+                print(
+                    f"[install-speed] no row matches appName/rawAppName {app!r}{ns_part} — check spelling or pass --namespace",
+                    file=sys.stderr,
+                )
 
         time.sleep(refresh)
 
