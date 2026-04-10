@@ -752,7 +752,7 @@ def render_share_bars_table(
         "title": title,
     }
     t = Table(**tbl_kw)
-    t.add_column("Step", overflow="ignore", min_width=16)
+    t.add_column("Step", overflow="fold", min_width=12)
     t.add_column("%", justify="right", width=7, overflow="ignore")
     t.add_column("Bar", overflow="ignore", min_width=bar_width + 2)
     t.add_column("sec", justify="right", width=8, overflow="ignore")
@@ -785,7 +785,7 @@ def render_share_bars_block(
 ) -> Table:
     """Phase timeline + per-Pod workload + per-Container image pull (three separate 100% domains)."""
     outer = Table(box=None, show_header=False, expand=True)
-    outer.add_column("share", overflow="ignore")
+    outer.add_column("share", overflow="fold")
     outer.add_row(
         render_share_bars_table(
             phase_durations_seconds(phase_tracker),
@@ -796,7 +796,11 @@ def render_share_bars_block(
         )
     )
     outer.add_row(
-        Text("100% = phase durations on one install timeline (not comparable to pod/container blocks).", style="dim")
+        Text(
+            "100% = phase durations on one timeline.\n"
+            "Not comparable to pod/container blocks below.",
+            style="dim",
+        )
     )
     outer.add_row(
         render_share_bars_table(
@@ -809,7 +813,8 @@ def render_share_bars_block(
     )
     outer.add_row(
         Text(
-            "100% = sum over pods of (sched+pull+S->R); multi-pod apps show which Pod name dominates.",
+            "100% = each pod's sched+pull+S->R summed;\n"
+            "which Pod name takes the largest share.",
             style="dim",
         )
     )
@@ -824,7 +829,8 @@ def render_share_bars_block(
     )
     outer.add_row(
         Text(
-            "100% = sum of measured pull windows; row = pod/container. Not additive with phase % or pod block.",
+            "100% = pull windows summed; rows are pod/container.\n"
+            "Separate from phase % and pod block above.",
             style="dim",
         )
     )
@@ -1211,7 +1217,7 @@ def render(
         expand=True,
     )
     root.add_column("Section", style="bold", width=12, overflow="ignore", no_wrap=True)
-    root.add_column("Details", overflow="ignore", no_wrap=False)
+    root.add_column("Details", overflow="fold", no_wrap=False)
 
     elapsed = dur_s(started_at, now_utc())
     am_line = Text()
@@ -1367,8 +1373,8 @@ def main() -> int:
     ap.add_argument(
         "--live-overflow",
         choices=("crop", "ellipsis", "visible"),
-        default="crop",
-        help="Rich Live when output exceeds terminal height: crop=show top lines only (default); ellipsis=last line '...'; visible=full height (may not clear cleanly while refreshing)",
+        default="visible",
+        help="Rich Live when output exceeds reported terminal height: visible=draw full frame (default; use with --no-alt-screen if you see flicker); crop/ellipsis truncate",
     )
     ap.add_argument(
         "--no-alt-screen",
@@ -1388,7 +1394,13 @@ def main() -> int:
             "Note: stdout is not a TTY; if the UI is blank, try: export FORCE_TERMINAL_UI=1",
             file=sys.stderr,
         )
-    console = Console(force_terminal=use_ft)
+    # Web/embedded terminals often mis-report size; optional override for Live height math.
+    _cons_kw: Dict[str, Any] = {"force_terminal": use_ft}
+    for _key, _env in (("height", "INSTALL_SPEED_TERM_ROWS"), ("width", "INSTALL_SPEED_TERM_COLS")):
+        _v = (os.environ.get(_env) or "").strip()
+        if _v.isdigit() and int(_v) > 0:
+            _cons_kw[_key] = int(_v)
+    console = Console(**_cons_kw)
 
     try:
         arm_start = now_utc()

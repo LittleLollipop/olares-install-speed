@@ -57,7 +57,7 @@ python watch_install_live.py --app <app-name> --refresh 1.0 --until-running
 - `--pie off`：三张百分比表，无条形图  
 - `--share-bar-width N`：条形字符宽度（默认 28）  
 - 默认可交互终端上会**清屏并进入备用屏幕**（独立缓冲区，从第 1 行占满高度，退出后恢复原屏幕）；不需要时用 `--no-alt-screen`  
-- `--live-overflow`：`crop` / `ellipsis` / `visible`（仍装不下可 `--pie off`、拉高窗口或 `--share-max-rows 6`）
+- `--live-overflow`：默认 **`visible`**（不把画面裁成「假高度」里的半截）；若刷新闪烁可改 `crop`。Web 终端若仍裁切，可设环境变量 **`INSTALL_SPEED_TERM_ROWS`** / **`INSTALL_SPEED_TERM_COLS`**（整数）覆盖 Rich 检测到的行列数。  
 
 #### 直接提供 appmgr（立即开始）
 ```bash
