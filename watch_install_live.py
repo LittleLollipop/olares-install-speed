@@ -1337,6 +1337,79 @@ def render(
     return root
 
 
+def monitor_refresh_tick(
+    co: client.CustomObjectsApi,
+    v1: client.CoreV1Api,
+    appmgr_name: str,
+    namespace: str,
+    args: Any,
+    started_at: datetime,
+    pod_event_cache: Dict[str, Dict[str, Any]],
+    phase_tracker: List[Tuple[str, datetime]],
+) -> Tuple[str, str, Table]:
+    """Fetch appmgr + pods/events, update caches, return (state, namespace, frame)."""
+    am: Dict[str, Any] = {}
+    try:
+        am = get_custom_object(co, appmgr_name)
+        am_state, am_progress, am_msg, am_time = summarize_appmgr(am)
+    except Exception as e:
+        am_state, am_progress, am_msg, am_time = "?", "-", f"get appmgr failed: {e}", None
+    update_phase_tracker(phase_tracker, am_state, am_time)
+
+    ns = namespace
+    try:
+        spec_ns = str(((am.get("spec") or {}).get("appNamespace")) or "")
+        if spec_ns:
+            ns = spec_ns
+    except Exception:
+        pass
+
+    raw_pods = list_pods(v1, ns)
+    pods, pod_hint = pick_pods_for_monitor(raw_pods, args.app, args.owner)
+
+    now = time.time()
+    for p in pods:
+        pn = p.metadata.name
+        c = pod_event_cache.get(pn)
+        if c and (now - float(c.get("ts") or 0.0)) < 5.0:
+            continue
+        evs = list_events_for_pod(v1, ns, pn)
+        pulling_first = find_first_event_time(evs, "Pulling")
+        pulled_last = find_last_event_time(evs, "Pulled")
+        started_ev = find_first_event_time(evs, "Started")
+        per_container = build_container_event_times(evs, p)
+        warn = summarize_warning(evs)
+
+        setattr(p, "_per_container_event_times", per_container)
+
+        pod_event_cache[pn] = {
+            "ts": now,
+            "pod_pulling_first": pulling_first,
+            "pod_pulled_last": pulled_last,
+            "pod_started_first": started_ev,
+            "per_container": per_container,
+            "warn": warn,
+        }
+
+    frame = render(
+        appmgr_name,
+        ns,
+        am_state,
+        am_progress,
+        am_msg,
+        am_time,
+        started_at,
+        pods,
+        pod_event_cache,
+        phase_tracker,
+        pie_mode=args.pie,
+        share_max_rows=max(4, min(30, args.share_max_rows)),
+        share_bar_width=max(12, min(60, args.share_bar_width)),
+        pod_filter_hint=pod_hint,
+    )
+    return am_state, ns, frame
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--namespace", help="Kubernetes namespace (optional, can be auto-detected from ApplicationManager)")
@@ -1380,6 +1453,11 @@ def main() -> int:
         "--no-alt-screen",
         action="store_true",
         help="Do not use the terminal alternate screen (default: use it on a real TTY so Live gets a full-height buffer from row 1)",
+    )
+    ap.add_argument(
+        "--no-live",
+        action="store_true",
+        help="Do not use Rich Live: clear + print full dashboard each refresh (fixes clipping in many web/embedded terminals; env INSTALL_SPEED_NO_LIVE=1 same)",
     )
     args = ap.parse_args()
 
@@ -1432,90 +1510,69 @@ def main() -> int:
     pod_event_cache: Dict[str, Dict[str, Any]] = {}
     phase_tracker: List[Tuple[str, datetime]] = []
 
-    use_alt_screen = bool(console.is_terminal and not args.no_alt_screen)
+    use_no_live = bool(
+        args.no_live
+        or os.environ.get("INSTALL_SPEED_NO_LIVE", "").lower() in ("1", "true", "yes")
+    )
+    use_alt_screen = bool(console.is_terminal and not args.no_alt_screen and not use_no_live)
     if use_alt_screen:
         console.clear()
 
-    with Live(
-        console=console,
-        refresh_per_second=max(1, int(1 / max(0.1, args.refresh))),
-        vertical_overflow=args.live_overflow,
-        screen=use_alt_screen,
-    ) as live:
+    if use_no_live:
+        print(
+            "[install-speed] no-live mode: clear + full print each refresh (avoids Rich Live vertical clip in web UIs).",
+            file=sys.stderr,
+        )
         while True:
             try:
-                am: Dict[str, Any] = {}
-                try:
-                    am = get_custom_object(co, appmgr_name)
-                    am_state, am_progress, am_msg, am_time = summarize_appmgr(am)
-                except Exception as e:
-                    am_state, am_progress, am_msg, am_time = "?", "-", f"get appmgr failed: {e}", None
-                update_phase_tracker(phase_tracker, am_state, am_time)
-
-                # Prefer namespace from appmgr spec once available
-                try:
-                    spec_ns = str(((am.get("spec") or {}).get("appNamespace")) or "")
-                    if spec_ns:
-                        namespace = spec_ns
-                except Exception:
-                    pass
-
-                raw_pods = list_pods(v1, namespace)
-                pods, pod_hint = pick_pods_for_monitor(raw_pods, args.app, args.owner)
-
-                # Update per-pod event cache (5s TTL) for Pulling/Pulled/Started timings
-                now = time.time()
-                for p in pods:
-                    pn = p.metadata.name
-                    c = pod_event_cache.get(pn)
-                    if c and (now - float(c.get("ts") or 0.0)) < 5.0:
-                        continue
-                    evs = list_events_for_pod(v1, namespace, pn)
-                    pulling_first = find_first_event_time(evs, "Pulling")
-                    pulled_last = find_last_event_time(evs, "Pulled")
-                    started_ev = find_first_event_time(evs, "Started")
-                    per_container = build_container_event_times(evs, p)
-                    warn = summarize_warning(evs)
-
-                    # Attach per-container to pod for container table rendering (best-effort).
-                    setattr(p, "_per_container_event_times", per_container)
-
-                    pod_event_cache[pn] = {
-                        "ts": now,
-                        "pod_pulling_first": pulling_first,
-                        "pod_pulled_last": pulled_last,
-                        "pod_started_first": started_ev,
-                        "per_container": per_container,
-                        "warn": warn,
-                    }
-
-                live.update(
-                    render(
-                        appmgr_name,
-                        namespace,
-                        am_state,
-                        am_progress,
-                        am_msg,
-                        am_time,
-                        started_at,
-                        pods,
-                        pod_event_cache,
-                        phase_tracker,
-                        pie_mode=args.pie,
-                        share_max_rows=max(4, min(30, args.share_max_rows)),
-                        share_bar_width=max(12, min(60, args.share_bar_width)),
-                        pod_filter_hint=pod_hint,
-                    )
+                am_state, namespace, frame = monitor_refresh_tick(
+                    co,
+                    v1,
+                    appmgr_name,
+                    namespace,
+                    args,
+                    started_at,
+                    pod_event_cache,
+                    phase_tracker,
                 )
-
+                console.clear()
+                console.print(frame)
                 if args.until_running and am_state.lower() == "running":
                     break
-
             except Exception as e:
                 print(f"[install-speed] monitor loop error: {e}", file=sys.stderr)
                 traceback.print_exc()
 
             time.sleep(args.refresh)
+    else:
+        with Live(
+            console=console,
+            refresh_per_second=max(1, int(1 / max(0.1, args.refresh))),
+            vertical_overflow=args.live_overflow,
+            screen=use_alt_screen,
+        ) as live:
+            while True:
+                try:
+                    am_state, namespace, frame = monitor_refresh_tick(
+                        co,
+                        v1,
+                        appmgr_name,
+                        namespace,
+                        args,
+                        started_at,
+                        pod_event_cache,
+                        phase_tracker,
+                    )
+                    live.update(frame)
+
+                    if args.until_running and am_state.lower() == "running":
+                        break
+
+                except Exception as e:
+                    print(f"[install-speed] monitor loop error: {e}", file=sys.stderr)
+                    traceback.print_exc()
+
+                time.sleep(args.refresh)
 
     console.print("[green]DONE[/green] appmgr reached Running" if args.until_running else "DONE")
     return 0

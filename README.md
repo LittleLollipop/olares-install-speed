@@ -50,6 +50,16 @@ export FORCE_TERMINAL_UI=1
 python watch_install_live.py --app <app-name> --refresh 1.0 --until-running
 ```
 
+**Olares / 浏览器里嵌套终端**若画面**上下仍被裁掉**（Rich `Live` 按 PTY 上报高度裁剪，与黑框视觉高度常不一致），请改用**整屏重绘模式**（不再用 `Live`）：
+
+```bash
+export INSTALL_SPEED_NO_LIVE=1
+python watch_install_live.py --app <app-name> --wait-new-install --refresh 1.0
+# 或等价：加上参数 --no-live
+```
+
+该模式每轮 `clear` 后打印**完整**一帧；若内嵌终端**没有滚动条**且物理行数仍少于输出总行数，底部仍可能被外壳裁切——那是宿主 UI 限制，只能加高终端区域或减小输出（如 `--pie off`、`--share-max-rows 6`）。
+
 占比用**三张独立条形图**（`--pie bars`，默认），语义分开：**阶段时间**（AppManager 一条时间线，合计 100%）、**按 Pod**（每个 Pod 上 sched+pull+Started→Ready 之和，在多 Pod 间谁占比大，合计 100%）、**按容器镜像拉取**（`pod/container` 或仅 Pod 级事件时的 `pod (pod pull)`，Pulling→Pulled 秒数在多行间占比，合计 100%）。三套**不可横向相加**。
 
 - `--pie compact`：同一行两饼：阶段 | 按 Pod；容器拉取占比见默认条形或 `--pie full`  
@@ -69,7 +79,7 @@ python watch_install_live.py \
 
 > 终端 UI 里会额外显示：
 > - `ApplicationManager` 状态切换的阶段时间线（enter 时间与已耗时）
-> - 阶段 / 按 Pod / 按容器 pull：**三套独立 100%**（多 Pod、多容器时看谁耗时更大）；`--pie` / `--share-bar-width` / `--no-alt-screen` / `--live-overflow` 可调显示方式
+> - 阶段 / 按 Pod / 按容器 pull：**三套独立 100%**（多 Pod、多容器时看谁耗时更大）；`--pie` / `--share-bar-width` / `--no-alt-screen` / `--live-overflow` / **`--no-live`（或 `INSTALL_SPEED_NO_LIVE=1`）** 可调显示方式
 > - 每个 Pod 的 `Sched/Pull/Start->Ready` 耗时（若常见 workload label 对不上 `--app`，会自动按 Pod 名包含应用名、再不行则列出 `spec.appNamespace` 下全部 Pod，并有一行灰色说明）
 > - 每个 Pod 的最新告警事件（例如 `FailedScheduling/ImagePullBackOff/BackOff/CrashLoopBackOff`）及持续时间
 > - 每个容器的 `Pull(+)`、`Created/Started` 事件时间、`startedAt`、`waiting reason`、重启次数等
