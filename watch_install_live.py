@@ -640,58 +640,84 @@ def phase_durations_seconds(tracker: List[Tuple[str, datetime]]) -> List[Tuple[s
     return out
 
 
-def aggregate_pod_step_seconds(
-    pods: List[client.V1Pod],
+def _pod_sched_pull_startready_seconds(
+    p: client.V1Pod,
     pod_event_cache: Dict[str, Dict[str, Any]],
     started_at: datetime,
 ) -> Tuple[float, float, float]:
-    """Sum per-pod schedule / pull / start->ready seconds (may overlap across pods and with app phases)."""
-    sum_sched = 0.0
-    sum_pull = 0.0
-    sum_sr = 0.0
-    for p in pods:
-        created = p.metadata.creation_timestamp or started_at
-        scheduled = pod_time_from_condition(p, "PodScheduled", "True")
-        s = dur_s(created, scheduled)
-        if s is not None and s > 0:
-            sum_sched += float(s)
+    """Per-pod: schedule delay, image pull window, first Started event -> Ready (seconds)."""
+    created = p.metadata.creation_timestamp or started_at
+    scheduled = pod_time_from_condition(p, "PodScheduled", "True")
+    sched = float(dur_s(created, scheduled) or 0.0)
+    if sched < 0:
+        sched = 0.0
 
-        pn = p.metadata.name
-        cache = pod_event_cache.get(pn) or {}
-        pulling_first = cache.get("pod_pulling_first")
-        pulled_last = cache.get("pod_pulled_last")
-        started_ev = cache.get("pod_started_first")
-        ready = pod_time_from_condition(p, "Ready", "True")
-
-        pl = dur_s(pulling_first, pulled_last)
-        if pl is not None and pl > 0:
-            sum_pull += float(pl)
-
-        sr = dur_s(started_ev, ready)
-        if sr is not None and sr > 0:
-            sum_sr += float(sr)
-
-    return sum_sched, sum_pull, sum_sr
+    pn = p.metadata.name or ""
+    cache = pod_event_cache.get(pn) or {}
+    pl = float(dur_s(cache.get("pod_pulling_first"), cache.get("pod_pulled_last")) or 0.0)
+    if pl < 0:
+        pl = 0.0
+    sr = float(dur_s(cache.get("pod_started_first"), pod_time_from_condition(p, "Ready", "True")) or 0.0)
+    if sr < 0:
+        sr = 0.0
+    return sched, pl, sr
 
 
-def build_combined_pie_slices(
-    tracker: List[Tuple[str, datetime]],
+def build_per_pod_track_slices(
     pods: List[client.V1Pod],
     pod_event_cache: Dict[str, Dict[str, Any]],
     started_at: datetime,
 ) -> List[Tuple[str, float]]:
-    out: List[Tuple[str, float]] = []
-    for name, sec in phase_durations_seconds(tracker):
-        if sec > 0.001:
-            out.append((name, sec))
-    s_sched, s_pull, s_sr = aggregate_pod_step_seconds(pods, pod_event_cache, started_at)
-    if s_sched > 0.001:
-        out.append(("Pod Σ Sched", s_sched))
-    if s_pull > 0.001:
-        out.append(("Pod Σ Pull", s_pull))
-    if s_sr > 0.001:
-        out.append(("Pod Σ Start→Ready", s_sr))
-    return out
+    """
+    One row per Pod: sched + pull + (Started->Ready) for that pod only.
+    % are shares of the sum across pods (which pod dominates aggregate infra time).
+    """
+    rows: List[Tuple[str, float]] = []
+    for p in pods:
+        pn = p.metadata.name or "?"
+        a, b, c = _pod_sched_pull_startready_seconds(p, pod_event_cache, started_at)
+        total = a + b + c
+        if total > 0.001:
+            rows.append((pn, total))
+    rows.sort(key=lambda x: -x[1])
+    return rows
+
+
+def build_per_container_pull_slices(
+    pods: List[client.V1Pod],
+    pod_event_cache: Dict[str, Dict[str, Any]],
+) -> List[Tuple[str, float]]:
+    """
+    One row per container: Pulling -> Pulled from events (which image pull is slowest).
+    If events only have pod-level pull times, one fallback row per pod: "pod (pod pull)".
+    """
+    rows: List[Tuple[str, float]] = []
+    pods_with_ctr_pull: set[str] = set()
+    for p in pods:
+        pn = p.metadata.name or "?"
+        per_ct: Dict[str, Dict[str, Optional[datetime]]] = getattr(
+            p, "_per_container_event_times", {}
+        )  # type: ignore[attr-defined]
+        if not p.status or not p.status.container_statuses:
+            continue
+        for cs in p.status.container_statuses:
+            ce = per_ct.get(cs.name) or {}
+            d = dur_s(ce.get("pulling_first"), ce.get("pulled_last"))
+            if d is not None and d > 0.001:
+                rows.append((f"{pn}/{cs.name}", float(d)))
+                pods_with_ctr_pull.add(pn)
+
+    for p in pods:
+        pn = p.metadata.name or "?"
+        if pn in pods_with_ctr_pull:
+            continue
+        cache = pod_event_cache.get(pn) or {}
+        d = dur_s(cache.get("pod_pulling_first"), cache.get("pod_pulled_last"))
+        if d is not None and d > 0.001:
+            rows.append((f"{pn} (pod pull)", float(d)))
+
+    rows.sort(key=lambda x: -x[1])
+    return rows
 
 
 def _merge_pie_slices(durs: List[Tuple[str, float]]) -> Tuple[List[Tuple[str, float]], float]:
@@ -754,51 +780,54 @@ def render_share_bars_block(
     pod_event_cache: Dict[str, Dict[str, Any]],
     started_at: datetime,
     *,
-    dual_tables: bool = False,
     max_rows: int = 10,
+    bar_width: int = 28,
 ) -> Table:
-    """
-    One combined bar table by default (shorter — avoids Live vertical ellipsis).
-    Phases already appear in combined slices; dual_tables=True restores two blocks.
-    """
-    combined = build_combined_pie_slices(phase_tracker, pods, pod_event_cache, started_at)
-    foot = Text(
-        "Phases + Pod Σ(Sched/Pull/Start→Ready); buckets may overlap.",
-        style="dim",
-    )
-    if not dual_tables:
-        outer = Table(box=None, show_header=False, expand=True)
-        outer.add_column("share", overflow="ignore")
-        outer.add_row(
-            render_share_bars_table(
-                combined,
-                "Share",
-                "no share data yet",
-                max_rows=max_rows,
-            )
-        )
-        outer.add_row(foot)
-        return outer
-
+    """Phase timeline + per-Pod workload + per-Container image pull (three separate 100% domains)."""
     outer = Table(box=None, show_header=False, expand=True)
     outer.add_column("share", overflow="ignore")
     outer.add_row(
         render_share_bars_table(
             phase_durations_seconds(phase_tracker),
-            "Phase share",
+            "Phase time (AppManager states)",
             "no phase data yet",
             max_rows=max_rows,
+            bar_width=bar_width,
+        )
+    )
+    outer.add_row(
+        Text("100% = phase durations on one install timeline (not comparable to pod/container blocks).", style="dim")
+    )
+    outer.add_row(
+        render_share_bars_table(
+            build_per_pod_track_slices(pods, pod_event_cache, started_at),
+            "By Pod (sched + pull + Started->Ready per pod)",
+            "no pod timing yet",
+            max_rows=max_rows,
+            bar_width=bar_width,
+        )
+    )
+    outer.add_row(
+        Text(
+            "100% = sum over pods of (sched+pull+S->R); multi-pod apps show which Pod name dominates.",
+            style="dim",
         )
     )
     outer.add_row(
         render_share_bars_table(
-            combined,
-            "Combined share",
-            "no combined data yet",
+            build_per_container_pull_slices(pods, pod_event_cache),
+            "By Container — image pull (Pulling->Pulled)",
+            "no per-container pull events yet",
             max_rows=max_rows,
+            bar_width=bar_width,
         )
     )
-    outer.add_row(foot)
+    outer.add_row(
+        Text(
+            "100% = sum of measured pull windows; row = pod/container. Not additive with phase % or pod block.",
+            style="dim",
+        )
+    )
     return outer
 
 
@@ -887,10 +916,10 @@ def render_pie_chart(
             pie.append("█", style=Style(color=color))
         pie.append("\n")
 
-    legend = Table(show_header=True, header_style="bold", box=None)
-    legend.add_column(legend_first_col)
-    legend.add_column("%", justify="right")
-    legend.add_column("s", justify="right")
+    legend = Table(show_header=True, header_style="bold", box=None, expand=True)
+    legend.add_column(legend_first_col, overflow="ignore", min_width=8)
+    legend.add_column("%", justify="right", width=6, overflow="ignore")
+    legend.add_column("s", justify="right", width=7, overflow="ignore")
     for i, (s, d) in enumerate(merged[:max_legend_rows]):
         color = PIE_PALETTE[i % len(PIE_PALETTE)]
         pct = (d / total) * 100 if total > 0 else 0.0
@@ -929,22 +958,41 @@ def render_phase_pie(
     )
 
 
-def render_combined_pie(
-    tracker: List[Tuple[str, datetime]],
+def render_pod_track_pie(
     pods: List[client.V1Pod],
     pod_event_cache: Dict[str, Dict[str, Any]],
     started_at: datetime,
     radius: int = 4,
     max_legend_rows: int = 16,
     footnote: Optional[str] = (
-        "Combined: AppManager phases + Pod Σ(Sched/Pull/Start→Ready). Buckets may overlap in real time; use as relative weight."
+        "Per Pod: sched+pull+Started->Ready summed for that pod; % = share across pods."
     ),
 ) -> Table:
-    slices = build_combined_pie_slices(tracker, pods, pod_event_cache, started_at)
+    slices = build_per_pod_track_slices(pods, pod_event_cache, started_at)
     return render_pie_chart(
         slices,
-        "Step",
-        "no combined data yet",
+        "Pod",
+        "no pod timing yet",
+        footnote=footnote,
+        radius=radius,
+        max_legend_rows=max_legend_rows,
+    )
+
+
+def render_container_pull_pie(
+    pods: List[client.V1Pod],
+    pod_event_cache: Dict[str, Dict[str, Any]],
+    radius: int = 4,
+    max_legend_rows: int = 16,
+    footnote: Optional[str] = (
+        "Per container: Pulling->Pulled from events; % = share across rows; (pod pull) = events not split by container."
+    ),
+) -> Table:
+    slices = build_per_container_pull_slices(pods, pod_event_cache)
+    return render_pie_chart(
+        slices,
+        "pod/ctr",
+        "no container pull data yet",
         footnote=footnote,
         radius=radius,
         max_legend_rows=max_legend_rows,
@@ -957,14 +1005,13 @@ def render_share_compact_row(
     pod_event_cache: Dict[str, Dict[str, Any]],
     started_at: datetime,
 ) -> Table:
-    """Single row: two small pies side-by-side + one footnote line (saves vertical space)."""
-    row = Table(box=None)
-    row.add_column("Phase")
-    row.add_column("Combined")
+    """One row: phase | per-pod track; container pull pie needs --pie full or see bars."""
+    row = Table(box=None, expand=True)
+    row.add_column("Phase", overflow="ignore")
+    row.add_column("By Pod", overflow="ignore")
     row.add_row(
         render_phase_pie(phase_tracker, radius=4, max_legend_rows=8),
-        render_combined_pie(
-            phase_tracker,
+        render_pod_track_pie(
             pods,
             pod_event_cache,
             started_at,
@@ -973,12 +1020,12 @@ def render_share_compact_row(
             footnote=None,
         ),
     )
-    wrap = Table(box=None, show_header=False)
-    wrap.add_column("block")
+    wrap = Table(box=None, show_header=False, expand=True)
+    wrap.add_column("block", overflow="ignore")
     wrap.add_row(row)
     wrap.add_row(
         Text(
-            "Combined: phases + Pod Σ(Sched/Pull/Start→Ready); buckets may overlap — relative weight only.",
+            "L: phase %. R: which Pod (sched+pull+S->R) is largest. Container pull %: --pie full or default bars.",
             style="dim",
         )
     )
@@ -1004,28 +1051,38 @@ def render_share_off_row(
     )
     wrap.add_row(
         render_share_legend_table(
-            build_combined_pie_slices(phase_tracker, pods, pod_event_cache, started_at),
-            "Combined %",
-            "no combined data",
+            build_per_pod_track_slices(pods, pod_event_cache, started_at),
+            "By Pod %",
+            "no pod timing",
             max_rows=12,
         )
     )
-    wrap.add_row(Text("Combined buckets may overlap wall-clock.", style="dim"))
+    wrap.add_row(
+        render_share_legend_table(
+            build_per_container_pull_slices(pods, pod_event_cache),
+            "By Ctr pull %",
+            "no container pull data",
+            max_rows=12,
+        )
+    )
+    wrap.add_row(
+        Text("Three blocks: phase | per-pod track | per-container pull (each own 100%).", style="dim")
+    )
     return wrap
 
 
 def render_container_table(pods: List[client.V1Pod]) -> Table:
-    t = Table(show_header=True, header_style="bold", box=None, expand=True)
-    t.add_column("Pod/Container", overflow="ignore", min_width=22)
-    t.add_column("State", overflow="ignore", width=10)
-    t.add_column("Ready", overflow="ignore", width=5)
-    t.add_column("Restarts", justify="right", width=7, overflow="ignore")
-    t.add_column("Pull(+)", justify="right", width=9, overflow="ignore")
-    t.add_column("Created(UTC)", overflow="ignore", min_width=18)
-    t.add_column("StartedEv(UTC)", overflow="ignore", min_width=18)
-    t.add_column("StartedAt(UTC)", overflow="ignore", min_width=18)
-    t.add_column("WaitingReason", overflow="ignore", min_width=14)
-    t.add_column("Image", overflow="ignore", min_width=28)
+    t = Table(show_header=True, header_style="bold", box=None, expand=True, pad_edge=False)
+    t.add_column("Pod/Ctr", overflow="ignore", min_width=16, max_width=34)
+    t.add_column("St", overflow="ignore", width=8)
+    t.add_column("Rd", overflow="ignore", width=3)
+    t.add_column("Rst", justify="right", width=4, overflow="ignore")
+    t.add_column("Pl+", justify="right", width=7, overflow="ignore")
+    t.add_column("Cre", overflow="ignore", min_width=16, max_width=20)
+    t.add_column("SEv", overflow="ignore", min_width=16, max_width=20)
+    t.add_column("SAt", overflow="ignore", min_width=16, max_width=20)
+    t.add_column("Wait", overflow="ignore", min_width=10, max_width=18)
+    t.add_column("Image", overflow="ignore", min_width=12, max_width=40)
 
     rows: List[Tuple[int, str, List[str]]] = []
     for p in pods:
@@ -1144,33 +1201,47 @@ def render(
     phase_tracker: List[Tuple[str, datetime]],
     pie_mode: str = "bars",
     *,
-    share_dual_tables: bool = False,
     share_max_rows: int = 10,
     pod_filter_hint: str = "",
+    share_bar_width: int = 28,
 ) -> Table:
     root = Table(
         title=f"Install Live Monitor  appmgr={appmgr_name}  ns={namespace}",
         show_lines=False,
         expand=True,
     )
-    root.add_column("Section", style="bold", width=14, overflow="ignore", no_wrap=True)
-    root.add_column("Details", overflow="ignore")
+    root.add_column("Section", style="bold", width=12, overflow="ignore", no_wrap=True)
+    root.add_column("Details", overflow="ignore", no_wrap=False)
 
     elapsed = dur_s(started_at, now_utc())
     am_line = Text()
-    am_line.append(f"state={am_state}  progress={am_progress}  ")
-    am_line.append(f"statusTime={dt_to_iso(am_time)}  ")
-    am_line.append(f"elapsed={fmt_dur(elapsed)}\n")
+    am_line.append(f"state={am_state}  progress={am_progress}  elapsed={fmt_dur(elapsed)}\n")
+    am_line.append(f"statusTime={dt_to_iso(am_time)}\n")
     am_line.append(f"message={am_msg}")
     root.add_row("ApplicationManager", am_line)
     root.add_row("Phases", render_phase_table(phase_tracker))
     if pie_mode == "off":
         root.add_row("Share", render_share_off_row(phase_tracker, pods, pod_event_cache, started_at))
     elif pie_mode == "full":
-        root.add_row("Phase Share", render_phase_pie(phase_tracker, radius=8, max_legend_rows=14))
+        root.add_row("Phase share", render_phase_pie(phase_tracker, radius=8, max_legend_rows=14))
         root.add_row(
-            "Combined Share",
-            render_combined_pie(phase_tracker, pods, pod_event_cache, started_at, radius=8, max_legend_rows=14),
+            "Pod share",
+            render_pod_track_pie(
+                pods,
+                pod_event_cache,
+                started_at,
+                radius=8,
+                max_legend_rows=14,
+            ),
+        )
+        root.add_row(
+            "Ctr pull",
+            render_container_pull_pie(
+                pods,
+                pod_event_cache,
+                radius=8,
+                max_legend_rows=14,
+            ),
         )
     elif pie_mode == "compact":
         root.add_row("Share", render_share_compact_row(phase_tracker, pods, pod_event_cache, started_at))
@@ -1182,21 +1253,21 @@ def render(
                 pods,
                 pod_event_cache,
                 started_at,
-                dual_tables=share_dual_tables,
                 max_rows=share_max_rows,
+                bar_width=share_bar_width,
             ),
         )
 
-    pods_tbl = Table(show_header=True, header_style="bold", box=None, expand=True)
-    pods_tbl.add_column("Pod", overflow="ignore", min_width=20)
-    pods_tbl.add_column("Node", overflow="ignore", min_width=10)
-    pods_tbl.add_column("Phase", overflow="ignore", width=10)
-    pods_tbl.add_column("Sched(+)", justify="right", overflow="ignore", width=9)
-    pods_tbl.add_column("Pull(+)", justify="right", overflow="ignore", width=9)
-    pods_tbl.add_column("Start->Ready(+)", justify="right", overflow="ignore", width=12)
-    pods_tbl.add_column("Warn", overflow="ignore", min_width=14)
-    pods_tbl.add_column("WarnMsg", overflow="ignore", min_width=24)
-    pods_tbl.add_column("Containers", overflow="ignore", min_width=20)
+    pods_tbl = Table(show_header=True, header_style="bold", box=None, expand=True, pad_edge=False)
+    pods_tbl.add_column("Pod", overflow="ignore", min_width=14, max_width=36)
+    pods_tbl.add_column("Node", overflow="ignore", min_width=6, max_width=14)
+    pods_tbl.add_column("Ph", overflow="ignore", width=7)
+    pods_tbl.add_column("Sch+", justify="right", overflow="ignore", width=7)
+    pods_tbl.add_column("Pl+", justify="right", overflow="ignore", width=7)
+    pods_tbl.add_column("S→R+", justify="right", overflow="ignore", width=7)
+    pods_tbl.add_column("Warn", overflow="ignore", min_width=8, max_width=22)
+    pods_tbl.add_column("Msg", overflow="ignore", min_width=10, max_width=32)
+    pods_tbl.add_column("Ctr", overflow="ignore", min_width=10, max_width=28)
 
     for p in sorted(pods, key=lambda x: (x.metadata.creation_timestamp or started_at)):
         created = p.metadata.creation_timestamp
@@ -1280,11 +1351,6 @@ def main() -> int:
         help="Share viz: bars=horizontal bars full width (default); compact=two small pies; full=large pies; off=tables only",
     )
     ap.add_argument(
-        "--share-dual",
-        action="store_true",
-        help="With --pie bars: show Phase share + Combined share as two tables (taller; may be cropped in short terminals)",
-    )
-    ap.add_argument(
         "--share-max-rows",
         type=int,
         default=10,
@@ -1292,10 +1358,22 @@ def main() -> int:
         help="Max bar-chart rows per table (default 10); lower if the Live UI is vertically cropped",
     )
     ap.add_argument(
+        "--share-bar-width",
+        type=int,
+        default=28,
+        metavar="N",
+        help="Horizontal bar width in characters for --pie bars (default 28)",
+    )
+    ap.add_argument(
         "--live-overflow",
         choices=("crop", "ellipsis", "visible"),
         default="crop",
         help="Rich Live when output exceeds terminal height: crop=show top lines only (default); ellipsis=last line '...'; visible=full height (may not clear cleanly while refreshing)",
+    )
+    ap.add_argument(
+        "--alt-screen",
+        action="store_true",
+        help="Draw Live on the terminal alternate screen (uses full window height from top; good for web/IDE terminals)",
     )
     args = ap.parse_args()
 
@@ -1346,6 +1424,7 @@ def main() -> int:
         console=console,
         refresh_per_second=max(1, int(1 / max(0.1, args.refresh))),
         vertical_overflow=args.live_overflow,
+        screen=args.alt_screen,
     ) as live:
         while True:
             try:
@@ -1407,8 +1486,8 @@ def main() -> int:
                         pod_event_cache,
                         phase_tracker,
                         pie_mode=args.pie,
-                        share_dual_tables=args.share_dual,
                         share_max_rows=max(4, min(30, args.share_max_rows)),
+                        share_bar_width=max(12, min(60, args.share_bar_width)),
                         pod_filter_hint=pod_hint,
                     )
                 )
