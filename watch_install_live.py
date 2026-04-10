@@ -108,14 +108,27 @@ def guess_appmgr_name(app: str, owner: str, namespace: str) -> List[str]:
     ]
 
 
-def _appmgr_sort_time(am: Dict[str, Any]) -> Optional[datetime]:
+def _appmgr_anchor_time(am: Dict[str, Any]) -> Optional[datetime]:
+    """
+    Latest relevant timestamp for this ApplicationManager: max of creationTimestamp
+    and status opTime/statusTime/updateTime. InstallOp alone is unreliable after Running
+    (opType may change); using max avoids missing a completed install.
+    """
+    times: List[datetime] = []
+    meta = am.get("metadata") or {}
+    ct = meta.get("creationTimestamp")
+    if isinstance(ct, str):
+        t = parse_ts(ct)
+        if t:
+            times.append(t)
     status = am.get("status") or {}
-    t_str = status.get("opTime") or status.get("statusTime") or status.get("updateTime")
-    t = parse_ts(t_str) if isinstance(t_str, str) else None
-    if not t:
-        ct = (am.get("metadata") or {}).get("creationTimestamp")
-        t = parse_ts(ct) if isinstance(ct, str) else None
-    return t
+    for key in ("opTime", "statusTime", "updateTime"):
+        t_str = status.get(key)
+        if isinstance(t_str, str):
+            t = parse_ts(t_str)
+            if t:
+                times.append(t)
+    return max(times) if times else None
 
 
 def pick_latest_appmgr_for_app(co: client.CustomObjectsApi, app: str) -> Optional[Tuple[str, str, Optional[str]]]:
@@ -125,7 +138,7 @@ def pick_latest_appmgr_for_app(co: client.CustomObjectsApi, app: str) -> Optiona
         spec = am.get("spec") or {}
         if str(spec.get("appName") or "") != app:
             continue
-        t = _appmgr_sort_time(am)
+        t = _appmgr_anchor_time(am)
         if not t:
             continue
         name = str(((am.get("metadata") or {}).get("name")) or "")
@@ -182,12 +195,15 @@ def pick_appmgr_or_wait(
             status = am.get("status") or {}
             if str(spec.get("appName") or "") != app:
                 continue
-            if str(spec.get("opType") or "") != OPTYPE_INSTALL and str(status.get("opType") or "") != OPTYPE_INSTALL:
-                continue
 
-            t = _appmgr_sort_time(am)
+            t = _appmgr_anchor_time(am)
             if not t or t < arm_start:
                 continue
+
+            # After install finishes, opType may no longer be InstallOp; --wait-new-install must still match.
+            if not wait_new_install:
+                if str(spec.get("opType") or "") != OPTYPE_INSTALL and str(status.get("opType") or "") != OPTYPE_INSTALL:
+                    continue
 
             if best is None or t > best[0]:
                 best = (t, am)
@@ -218,8 +234,9 @@ def pick_appmgr_or_wait(
         if time.time() - wait_log >= 5.0:
             wait_log = time.time()
             print(
-                f"[install-speed] Waiting for ApplicationManager for app={app!r} with install activity after script start... "
-                f"(already Running? omit --wait-new-install to attach to existing, or pass --appmgr NAME)",
+                f"[install-speed] Waiting for ApplicationManager spec.appName={app!r} with any timestamp after script start... "
+                f"(check exact name: kubectl get applicationmanagers -o custom-columns=NAME:.metadata.name,APP:.spec.appName ; "
+                f"or omit --wait-new-install / use --appmgr)",
                 file=sys.stderr,
             )
 
