@@ -569,10 +569,10 @@ def update_phase_tracker(
 
 
 def render_phase_table(tracker: List[Tuple[str, datetime]]) -> Table:
-    t = Table(show_header=True, header_style="bold", box=None)
-    t.add_column("Phase")
-    t.add_column("Enter(UTC)")
-    t.add_column("Duration", justify="right")
+    t = Table(show_header=True, header_style="bold", box=None, expand=True)
+    t.add_column("Phase", overflow="ignore", min_width=12)
+    t.add_column("Enter(UTC)", overflow="ignore", min_width=18)
+    t.add_column("Duration", justify="right", width=10, overflow="ignore")
     now = now_utc()
     for i, (st, enter) in enumerate(tracker[-8:]):
         exit_t = tracker[i + 1][1] if i + 1 < len(tracker) else None
@@ -662,6 +662,76 @@ def _merge_pie_slices(durs: List[Tuple[str, float]]) -> Tuple[List[Tuple[str, fl
     return merged, total_m
 
 
+def render_share_bars_table(
+    raw_slices: List[Tuple[str, float]],
+    title: str,
+    empty_msg: str,
+    max_rows: int = 14,
+    bar_width: int = 36,
+) -> Table:
+    """Horizontal bar chart (readable in narrow terminals; no round pie)."""
+    durs = [(s, d) for s, d in raw_slices if d > 0.001]
+    tbl_kw: Dict[str, Any] = {
+        "show_header": True,
+        "header_style": "bold",
+        "box": None,
+        "expand": True,
+        "title": title,
+    }
+    t = Table(**tbl_kw)
+    t.add_column("Step", overflow="ignore", min_width=16)
+    t.add_column("%", justify="right", width=7, overflow="ignore")
+    t.add_column("Bar", overflow="ignore", min_width=bar_width + 2)
+    t.add_column("sec", justify="right", width=8, overflow="ignore")
+    if not durs:
+        t.add_row(Text(empty_msg, style="dim"), "-", "", "-")
+        return t
+    merged, total = _merge_pie_slices(durs)
+    for i, (s, d) in enumerate(merged[:max_rows]):
+        pct = (d / total) * 100 if total > 0 else 0.0
+        filled = int(round(pct / 100.0 * bar_width))
+        filled = max(0, min(filled, bar_width))
+        bar_plain = "█" * filled + "·" * (bar_width - filled)
+        color = PIE_PALETTE[i % len(PIE_PALETTE)]
+        bar_cell = Text(bar_plain, style=Style(color=color))
+        label = Text(str(s), style=Style(color=color))
+        t.add_row(label, f"{pct:.1f}", bar_cell, f"{d:.0f}")
+    if len(merged) > max_rows:
+        t.add_row(Text("…", style="dim"), "", "", "")
+    return t
+
+
+def render_share_bars_block(
+    phase_tracker: List[Tuple[str, datetime]],
+    pods: List[client.V1Pod],
+    pod_event_cache: Dict[str, Dict[str, Any]],
+    started_at: datetime,
+) -> Table:
+    outer = Table(box=None, show_header=False, expand=True)
+    outer.add_column("share", overflow="ignore")
+    outer.add_row(
+        render_share_bars_table(
+            phase_durations_seconds(phase_tracker),
+            "Phase share",
+            "no phase data yet",
+        )
+    )
+    outer.add_row(
+        render_share_bars_table(
+            build_combined_pie_slices(phase_tracker, pods, pod_event_cache, started_at),
+            "Combined share",
+            "no combined data yet",
+        )
+    )
+    outer.add_row(
+        Text(
+            "Combined: AppManager phases + Pod Σ(Sched/Pull/Start→Ready); buckets may overlap (relative weight).",
+            style="dim",
+        )
+    )
+    return outer
+
+
 def render_share_legend_table(
     raw_slices: List[Tuple[str, float]],
     title: Optional[str],
@@ -670,13 +740,13 @@ def render_share_legend_table(
 ) -> Table:
     """Percentage table only (no ASCII pie) — minimal vertical space."""
     durs = [(s, d) for s, d in raw_slices if d > 0.001]
-    tbl_kw: Dict[str, Any] = {"show_header": True, "header_style": "bold", "box": None}
+    tbl_kw: Dict[str, Any] = {"show_header": True, "header_style": "bold", "box": None, "expand": True}
     if title:
         tbl_kw["title"] = title
     t = Table(**tbl_kw)
-    t.add_column("Step", overflow="fold")
-    t.add_column("%", justify="right")
-    t.add_column("s", justify="right")
+    t.add_column("Step", overflow="ignore", min_width=14)
+    t.add_column("%", justify="right", width=7, overflow="ignore")
+    t.add_column("s", justify="right", width=8, overflow="ignore")
     if not durs:
         t.add_row(Text(empty_msg, style="dim"), "-", "-")
         return t
@@ -851,43 +921,41 @@ def render_share_off_row(
     pod_event_cache: Dict[str, Dict[str, Any]],
     started_at: datetime,
 ) -> Table:
-    """Legend tables only, side-by-side — minimal height."""
-    row = Table(box=None)
-    row.add_column("Phase %")
-    row.add_column("Combined %")
-    row.add_row(
+    """Tables only, stacked full width (avoids narrow columns / ellipsis)."""
+    wrap = Table(box=None, show_header=False, expand=True)
+    wrap.add_column("block", overflow="ignore")
+    wrap.add_row(
         render_share_legend_table(
             phase_durations_seconds(phase_tracker),
-            "",
+            "Phase %",
             "no phase data",
-            max_rows=10,
-        ),
+            max_rows=12,
+        )
+    )
+    wrap.add_row(
         render_share_legend_table(
             build_combined_pie_slices(phase_tracker, pods, pod_event_cache, started_at),
-            "",
+            "Combined %",
             "no combined data",
-            max_rows=10,
-        ),
+            max_rows=12,
+        )
     )
-    wrap = Table(box=None, show_header=False)
-    wrap.add_column("block")
-    wrap.add_row(row)
     wrap.add_row(Text("Combined buckets may overlap wall-clock.", style="dim"))
     return wrap
 
 
 def render_container_table(pods: List[client.V1Pod]) -> Table:
-    t = Table(show_header=True, header_style="bold", box=None)
-    t.add_column("Pod/Container", overflow="fold")
-    t.add_column("State")
-    t.add_column("Ready")
-    t.add_column("Restarts", justify="right")
-    t.add_column("Pull(+)", justify="right")
-    t.add_column("Created(UTC)")
-    t.add_column("StartedEv(UTC)")
-    t.add_column("StartedAt(UTC)")
-    t.add_column("WaitingReason", overflow="fold")
-    t.add_column("Image", overflow="fold")
+    t = Table(show_header=True, header_style="bold", box=None, expand=True)
+    t.add_column("Pod/Container", overflow="ignore", min_width=22)
+    t.add_column("State", overflow="ignore", width=10)
+    t.add_column("Ready", overflow="ignore", width=5)
+    t.add_column("Restarts", justify="right", width=7, overflow="ignore")
+    t.add_column("Pull(+)", justify="right", width=9, overflow="ignore")
+    t.add_column("Created(UTC)", overflow="ignore", min_width=18)
+    t.add_column("StartedEv(UTC)", overflow="ignore", min_width=18)
+    t.add_column("StartedAt(UTC)", overflow="ignore", min_width=18)
+    t.add_column("WaitingReason", overflow="ignore", min_width=14)
+    t.add_column("Image", overflow="ignore", min_width=28)
 
     rows: List[Tuple[int, str, List[str]]] = []
     for p in pods:
@@ -981,11 +1049,15 @@ def render(
     pods: List[client.V1Pod],
     pod_event_cache: Dict[str, Dict[str, Any]],
     phase_tracker: List[Tuple[str, datetime]],
-    pie_mode: str = "compact",
+    pie_mode: str = "bars",
 ) -> Table:
-    root = Table(title=f"Install Live Monitor  appmgr={appmgr_name}  ns={namespace}", show_lines=False)
-    root.add_column("Section", style="bold")
-    root.add_column("Details")
+    root = Table(
+        title=f"Install Live Monitor  appmgr={appmgr_name}  ns={namespace}",
+        show_lines=False,
+        expand=True,
+    )
+    root.add_column("Section", style="bold", width=14, overflow="ignore", no_wrap=True)
+    root.add_column("Details", overflow="ignore")
 
     elapsed = dur_s(started_at, now_utc())
     am_line = Text()
@@ -1003,19 +1075,21 @@ def render(
             "Combined Share",
             render_combined_pie(phase_tracker, pods, pod_event_cache, started_at, radius=8, max_legend_rows=14),
         )
-    else:
+    elif pie_mode == "compact":
         root.add_row("Share", render_share_compact_row(phase_tracker, pods, pod_event_cache, started_at))
+    else:
+        root.add_row("Share", render_share_bars_block(phase_tracker, pods, pod_event_cache, started_at))
 
-    pods_tbl = Table(show_header=True, header_style="bold", box=None)
-    pods_tbl.add_column("Pod", overflow="fold")
-    pods_tbl.add_column("Node", overflow="fold")
-    pods_tbl.add_column("Phase")
-    pods_tbl.add_column("Sched(+)", justify="right")
-    pods_tbl.add_column("Pull(+)", justify="right")
-    pods_tbl.add_column("Start->Ready(+)", justify="right")
-    pods_tbl.add_column("Warn", overflow="fold")
-    pods_tbl.add_column("WarnMsg", overflow="fold")
-    pods_tbl.add_column("Containers", overflow="fold")
+    pods_tbl = Table(show_header=True, header_style="bold", box=None, expand=True)
+    pods_tbl.add_column("Pod", overflow="ignore", min_width=20)
+    pods_tbl.add_column("Node", overflow="ignore", min_width=10)
+    pods_tbl.add_column("Phase", overflow="ignore", width=10)
+    pods_tbl.add_column("Sched(+)", justify="right", overflow="ignore", width=9)
+    pods_tbl.add_column("Pull(+)", justify="right", overflow="ignore", width=9)
+    pods_tbl.add_column("Start->Ready(+)", justify="right", overflow="ignore", width=12)
+    pods_tbl.add_column("Warn", overflow="ignore", min_width=14)
+    pods_tbl.add_column("WarnMsg", overflow="ignore", min_width=24)
+    pods_tbl.add_column("Containers", overflow="ignore", min_width=20)
 
     for p in sorted(pods, key=lambda x: (x.metadata.creation_timestamp or started_at)):
         created = p.metadata.creation_timestamp
@@ -1055,9 +1129,9 @@ def render(
 
         warn_msg_cell = "-"
         if warn_msg:
-            warn_msg_cell = str(warn_msg).replace("\n", " ")
-            if len(warn_msg_cell) > 90:
-                warn_msg_cell = warn_msg_cell[:87] + "..."
+            warn_msg_cell = str(warn_msg).replace("\n", " ").replace("\t", " ")
+            if len(warn_msg_cell) > 500:
+                warn_msg_cell = warn_msg_cell[:497] + "..."
 
         pods_tbl.add_row(
             p.metadata.name,
@@ -1091,9 +1165,9 @@ def main() -> int:
     )
     ap.add_argument(
         "--pie",
-        choices=("compact", "full", "off"),
-        default="compact",
-        help="Share charts: compact=two small pies in one row (default); full=large pies on two rows; off=percent tables only",
+        choices=("bars", "compact", "full", "off"),
+        default="bars",
+        help="Share viz: bars=horizontal bars full width (default); compact=two small pies; full=large pies; off=tables only",
     )
     args = ap.parse_args()
 
