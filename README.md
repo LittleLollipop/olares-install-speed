@@ -70,7 +70,7 @@ python watch_install_live.py \
 > 终端 UI 里会额外显示：
 > - `ApplicationManager` 状态切换的阶段时间线（enter 时间与已耗时）
 > - 阶段 / 合并占比：默认**单表条形图**；可用 `--pie compact` / `--pie full` / `--pie off` / `--share-dual` 调整；`--live-overflow` 控制超出终端高度时的裁切方式
-> - 每个 Pod 的 `Sched/Pull/Start->Ready` 耗时
+> - 每个 Pod 的 `Sched/Pull/Start->Ready` 耗时（若常见 workload label 对不上 `--app`，会自动按 Pod 名包含应用名、再不行则列出 `spec.appNamespace` 下全部 Pod，并有一行灰色说明）
 > - 每个 Pod 的最新告警事件（例如 `FailedScheduling/ImagePullBackOff/BackOff/CrashLoopBackOff`）及持续时间
 > - 每个容器的 `Pull(+)`、`Created/Started` 事件时间、`startedAt`、`waiting reason`、重启次数等
 

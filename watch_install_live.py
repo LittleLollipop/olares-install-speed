@@ -3,6 +3,7 @@ import argparse
 import os
 import sys
 import time
+import traceback
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -18,7 +19,7 @@ except Exception as e:
     raise
 
 try:
-    from rich.console import Console
+    from rich.console import Console, Group
     from rich.live import Live
     from rich.table import Table
     from rich.text import Text
@@ -339,7 +340,17 @@ def pod_time_from_condition(pod: client.V1Pod, cond_type: str, cond_status: str 
 
 
 def list_pods(v1: client.CoreV1Api, namespace: str) -> List[client.V1Pod]:
-    return v1.list_namespaced_pod(namespace=namespace).items
+    try:
+        return v1.list_namespaced_pod(namespace=namespace).items
+    except ApiException as e:
+        print(
+            f"[install-speed] list_namespaced_pod ns={namespace!r} failed: {e.status} {e.reason}",
+            file=sys.stderr,
+        )
+        return []
+    except Exception as e:
+        print(f"[install-speed] list_namespaced_pod ns={namespace!r} failed: {e}", file=sys.stderr)
+        return []
 
 
 def list_events_for_pod(v1: client.CoreV1Api, namespace: str, pod_name: str) -> List[client.CoreV1Event]:
@@ -526,6 +537,7 @@ def filter_pods(pods: List[client.V1Pod], app: Optional[str], owner: Optional[st
                     "bytetrade.io/app",
                     "app",
                     "app.kubernetes.io/name",
+                    "app.kubernetes.io/instance",
                 ]
             ) or any(("app" in k and labels.get(k) == app) for k in labels.keys())
         if owner:
@@ -540,6 +552,41 @@ def filter_pods(pods: List[client.V1Pod], app: Optional[str], owner: Optional[st
         if app_hit and owner_hit:
             ret.append(p)
     return ret
+
+
+def pick_pods_for_monitor(
+    pods: List[client.V1Pod],
+    app: Optional[str],
+    owner: Optional[str],
+) -> Tuple[List[client.V1Pod], str]:
+    """
+    Prefer strict label filter; if it yields nothing, fall back so the UI still shows workloads.
+    Olares/Helm pods often omit app.bytetrade.io/name but names still contain the app id.
+    """
+    if not pods:
+        return [], ""
+    if not app and not owner:
+        return pods, ""
+    strict = filter_pods(pods, app, owner)
+    if strict:
+        return strict, ""
+    if owner and app:
+        loose = filter_pods(pods, app, None)
+        if loose:
+            return loose, "Pods: owner label not on workloads; dropped owner filter for pod list."
+    if app:
+        al = app.lower()
+        by_name = [p for p in pods if al in (p.metadata.name or "").lower()]
+        if by_name:
+            return by_name, "Pods: labels did not match --app; showing pods whose name contains the app name."
+        return pods, "Pods: labels did not match --app; showing all pods in app namespace (usually one app)."
+    if owner:
+        ol = owner.lower()
+        by_name = [p for p in pods if ol in (p.metadata.name or "").lower()]
+        if by_name:
+            return by_name, "Pods: owner label missing; matched pod name."
+        return pods, "Pods: owner label missing; showing all pods in namespace."
+    return pods, ""
 
 
 def summarize_appmgr(am: Dict[str, Any]) -> Tuple[str, str, str, Optional[datetime]]:
@@ -982,14 +1029,37 @@ def render_container_table(pods: List[client.V1Pod]) -> Table:
 
     rows: List[Tuple[int, str, List[str]]] = []
     for p in pods:
-        if not p.status or not p.status.container_statuses:
+        if not p.status:
             continue
 
         # Best-effort per-container event times (requires events embedded in pod annotations cache upstream).
         # Caller may attach a precomputed map on pod object dynamically; otherwise blank.
         per_ct: Dict[str, Dict[str, Optional[datetime]]] = getattr(p, "_per_container_event_times", {})  # type: ignore[attr-defined]
 
-        for cs in p.status.container_statuses:
+        cstat = p.status.container_statuses
+        if not cstat:
+            phase = (p.status.phase or "-") or "-"
+            rows.append(
+                (
+                    0,
+                    p.metadata.name or "-",
+                    [
+                        f"{p.metadata.name or '-'}/—",
+                        phase,
+                        "?",
+                        "0",
+                        "-",
+                        "-",
+                        "-",
+                        "-",
+                        "no containerStatuses yet (scheduling/pulling?)",
+                        "-",
+                    ],
+                )
+            )
+            continue
+
+        for cs in cstat:
             state = "-"
             started_at: Optional[datetime] = None
             waiting_reason = ""
@@ -1076,6 +1146,7 @@ def render(
     *,
     share_dual_tables: bool = False,
     share_max_rows: int = 10,
+    pod_filter_hint: str = "",
 ) -> Table:
     root = Table(
         title=f"Install Live Monitor  appmgr={appmgr_name}  ns={namespace}",
@@ -1181,7 +1252,10 @@ def render(
             c_line,
         )
 
-    root.add_row("Pods", pods_tbl)
+    pods_panel: Any = pods_tbl
+    if pod_filter_hint:
+        pods_panel = Group(Text(pod_filter_hint, style="dim"), pods_tbl)
+    root.add_row("Pods", pods_panel)
     root.add_row("Containers", render_container_table(pods))
     return root
 
@@ -1275,68 +1349,76 @@ def main() -> int:
     ) as live:
         while True:
             try:
-                am = get_custom_object(co, appmgr_name)
-                am_state, am_progress, am_msg, am_time = summarize_appmgr(am)
-            except Exception as e:
-                am_state, am_progress, am_msg, am_time = "?", "-", f"get appmgr failed: {e}", None
-            update_phase_tracker(phase_tracker, am_state, am_time)
+                am: Dict[str, Any] = {}
+                try:
+                    am = get_custom_object(co, appmgr_name)
+                    am_state, am_progress, am_msg, am_time = summarize_appmgr(am)
+                except Exception as e:
+                    am_state, am_progress, am_msg, am_time = "?", "-", f"get appmgr failed: {e}", None
+                update_phase_tracker(phase_tracker, am_state, am_time)
 
-            # Prefer namespace from appmgr spec once available
-            try:
-                spec_ns = str(((am.get("spec") or {}).get("appNamespace")) or "")
-                if spec_ns:
-                    namespace = spec_ns
-            except Exception:
-                pass
+                # Prefer namespace from appmgr spec once available
+                try:
+                    spec_ns = str(((am.get("spec") or {}).get("appNamespace")) or "")
+                    if spec_ns:
+                        namespace = spec_ns
+                except Exception:
+                    pass
 
-            pods = filter_pods(list_pods(v1, namespace), args.app, args.owner)
+                raw_pods = list_pods(v1, namespace)
+                pods, pod_hint = pick_pods_for_monitor(raw_pods, args.app, args.owner)
 
-            # Update per-pod event cache (5s TTL) for Pulling/Pulled/Started timings
-            now = time.time()
-            for p in pods:
-                pn = p.metadata.name
-                c = pod_event_cache.get(pn)
-                if c and (now - float(c.get("ts") or 0.0)) < 5.0:
-                    continue
-                evs = list_events_for_pod(v1, namespace, pn)
-                pulling_first = find_first_event_time(evs, "Pulling")
-                pulled_last = find_last_event_time(evs, "Pulled")
-                started_ev = find_first_event_time(evs, "Started")
-                per_container = build_container_event_times(evs, p)
-                warn = summarize_warning(evs)
+                # Update per-pod event cache (5s TTL) for Pulling/Pulled/Started timings
+                now = time.time()
+                for p in pods:
+                    pn = p.metadata.name
+                    c = pod_event_cache.get(pn)
+                    if c and (now - float(c.get("ts") or 0.0)) < 5.0:
+                        continue
+                    evs = list_events_for_pod(v1, namespace, pn)
+                    pulling_first = find_first_event_time(evs, "Pulling")
+                    pulled_last = find_last_event_time(evs, "Pulled")
+                    started_ev = find_first_event_time(evs, "Started")
+                    per_container = build_container_event_times(evs, p)
+                    warn = summarize_warning(evs)
 
-                # Attach per-container to pod for container table rendering (best-effort).
-                setattr(p, "_per_container_event_times", per_container)
+                    # Attach per-container to pod for container table rendering (best-effort).
+                    setattr(p, "_per_container_event_times", per_container)
 
-                pod_event_cache[pn] = {
-                    "ts": now,
-                    "pod_pulling_first": pulling_first,
-                    "pod_pulled_last": pulled_last,
-                    "pod_started_first": started_ev,
-                    "per_container": per_container,
-                    "warn": warn,
-                }
+                    pod_event_cache[pn] = {
+                        "ts": now,
+                        "pod_pulling_first": pulling_first,
+                        "pod_pulled_last": pulled_last,
+                        "pod_started_first": started_ev,
+                        "per_container": per_container,
+                        "warn": warn,
+                    }
 
-            live.update(
-                render(
-                    appmgr_name,
-                    namespace,
-                    am_state,
-                    am_progress,
-                    am_msg,
-                    am_time,
-                    started_at,
-                    pods,
-                    pod_event_cache,
-                    phase_tracker,
-                    pie_mode=args.pie,
-                    share_dual_tables=args.share_dual,
-                    share_max_rows=max(4, min(30, args.share_max_rows)),
+                live.update(
+                    render(
+                        appmgr_name,
+                        namespace,
+                        am_state,
+                        am_progress,
+                        am_msg,
+                        am_time,
+                        started_at,
+                        pods,
+                        pod_event_cache,
+                        phase_tracker,
+                        pie_mode=args.pie,
+                        share_dual_tables=args.share_dual,
+                        share_max_rows=max(4, min(30, args.share_max_rows)),
+                        pod_filter_hint=pod_hint,
+                    )
                 )
-            )
 
-            if args.until_running and am_state.lower() == "running":
-                break
+                if args.until_running and am_state.lower() == "running":
+                    break
+
+            except Exception as e:
+                print(f"[install-speed] monitor loop error: {e}", file=sys.stderr)
+                traceback.print_exc()
 
             time.sleep(args.refresh)
 
