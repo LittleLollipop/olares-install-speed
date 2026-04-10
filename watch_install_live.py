@@ -1121,6 +1121,7 @@ def main() -> int:
             arm_start=arm_start,
             refresh=args.refresh,
             wait_new_install=args.wait_new_install,
+            filter_namespace=args.namespace,
         )
         if not args.owner and detected_owner:
             args.owner = detected_owner
