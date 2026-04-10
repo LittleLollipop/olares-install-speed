@@ -50,11 +50,14 @@ export FORCE_TERMINAL_UI=1
 python watch_install_live.py --app <app-name> --refresh 1.0 --until-running
 ```
 
-占比默认用**横向条形图**（`--pie bars`，默认），避免窄终端里饼图图例被挤成省略号。需要饼图时：
+占比默认用**横向条形图**（`--pie bars`，默认），且**合并为一张表**（阶段与 Pod 汇总同在 `Share` 里，比「Phase + Combined」两块更省行数）。需要饼图或双表时：
 
 - `--pie compact`：同一行两个小号饼图  
 - `--pie full`：两行大号饼图  
 - `--pie off`：只显示百分比表，不占条形/饼图高度  
+- `--share-dual`：条形模式下恢复「Phase share」与「Combined share」两张表（更占垂直空间）
+
+**终端高度不够时**，Rich 的 `Live` 会裁掉底部内容；旧默认最后一行是红色的 `…`，容易误以为是图表坏了。本脚本默认 `--live-overflow crop`（不占用那一行省略号，多一行有效内容）。仍装不下时可：`--pie off`、把终端拉高、`--share-max-rows 6` 减小行数，或 `--live-overflow visible`（尽量显示全部；刷新时偶发残行，见 Rich 文档说明）。
 
 #### 直接提供 appmgr（立即开始）
 ```bash
@@ -66,7 +69,7 @@ python watch_install_live.py \
 
 > 终端 UI 里会额外显示：
 > - `ApplicationManager` 状态切换的阶段时间线（enter 时间与已耗时）
-> - 阶段 / 合并占比：默认**条形图**；可用 `--pie compact` / `--pie full` / `--pie off` 调整
+> - 阶段 / 合并占比：默认**单表条形图**；可用 `--pie compact` / `--pie full` / `--pie off` / `--share-dual` 调整；`--live-overflow` 控制超出终端高度时的裁切方式
 > - 每个 Pod 的 `Sched/Pull/Start->Ready` 耗时
 > - 每个 Pod 的最新告警事件（例如 `FailedScheduling/ImagePullBackOff/BackOff/CrashLoopBackOff`）及持续时间
 > - 每个容器的 `Pull(+)`、`Created/Started` 事件时间、`startedAt`、`waiting reason`、重启次数等

@@ -706,7 +706,33 @@ def render_share_bars_block(
     pods: List[client.V1Pod],
     pod_event_cache: Dict[str, Dict[str, Any]],
     started_at: datetime,
+    *,
+    dual_tables: bool = False,
+    max_rows: int = 10,
 ) -> Table:
+    """
+    One combined bar table by default (shorter — avoids Live vertical ellipsis).
+    Phases already appear in combined slices; dual_tables=True restores two blocks.
+    """
+    combined = build_combined_pie_slices(phase_tracker, pods, pod_event_cache, started_at)
+    foot = Text(
+        "Phases + Pod Σ(Sched/Pull/Start→Ready); buckets may overlap.",
+        style="dim",
+    )
+    if not dual_tables:
+        outer = Table(box=None, show_header=False, expand=True)
+        outer.add_column("share", overflow="ignore")
+        outer.add_row(
+            render_share_bars_table(
+                combined,
+                "Share",
+                "no share data yet",
+                max_rows=max_rows,
+            )
+        )
+        outer.add_row(foot)
+        return outer
+
     outer = Table(box=None, show_header=False, expand=True)
     outer.add_column("share", overflow="ignore")
     outer.add_row(
@@ -714,21 +740,18 @@ def render_share_bars_block(
             phase_durations_seconds(phase_tracker),
             "Phase share",
             "no phase data yet",
+            max_rows=max_rows,
         )
     )
     outer.add_row(
         render_share_bars_table(
-            build_combined_pie_slices(phase_tracker, pods, pod_event_cache, started_at),
+            combined,
             "Combined share",
             "no combined data yet",
+            max_rows=max_rows,
         )
     )
-    outer.add_row(
-        Text(
-            "Combined: AppManager phases + Pod Σ(Sched/Pull/Start→Ready); buckets may overlap (relative weight).",
-            style="dim",
-        )
-    )
+    outer.add_row(foot)
     return outer
 
 
@@ -1050,6 +1073,9 @@ def render(
     pod_event_cache: Dict[str, Dict[str, Any]],
     phase_tracker: List[Tuple[str, datetime]],
     pie_mode: str = "bars",
+    *,
+    share_dual_tables: bool = False,
+    share_max_rows: int = 10,
 ) -> Table:
     root = Table(
         title=f"Install Live Monitor  appmgr={appmgr_name}  ns={namespace}",
@@ -1078,7 +1104,17 @@ def render(
     elif pie_mode == "compact":
         root.add_row("Share", render_share_compact_row(phase_tracker, pods, pod_event_cache, started_at))
     else:
-        root.add_row("Share", render_share_bars_block(phase_tracker, pods, pod_event_cache, started_at))
+        root.add_row(
+            "Share",
+            render_share_bars_block(
+                phase_tracker,
+                pods,
+                pod_event_cache,
+                started_at,
+                dual_tables=share_dual_tables,
+                max_rows=share_max_rows,
+            ),
+        )
 
     pods_tbl = Table(show_header=True, header_style="bold", box=None, expand=True)
     pods_tbl.add_column("Pod", overflow="ignore", min_width=20)
@@ -1169,6 +1205,24 @@ def main() -> int:
         default="bars",
         help="Share viz: bars=horizontal bars full width (default); compact=two small pies; full=large pies; off=tables only",
     )
+    ap.add_argument(
+        "--share-dual",
+        action="store_true",
+        help="With --pie bars: show Phase share + Combined share as two tables (taller; may be cropped in short terminals)",
+    )
+    ap.add_argument(
+        "--share-max-rows",
+        type=int,
+        default=10,
+        metavar="N",
+        help="Max bar-chart rows per table (default 10); lower if the Live UI is vertically cropped",
+    )
+    ap.add_argument(
+        "--live-overflow",
+        choices=("crop", "ellipsis", "visible"),
+        default="crop",
+        help="Rich Live when output exceeds terminal height: crop=show top lines only (default); ellipsis=last line '...'; visible=full height (may not clear cleanly while refreshing)",
+    )
     args = ap.parse_args()
 
     load_kube_config()
@@ -1214,7 +1268,11 @@ def main() -> int:
     pod_event_cache: Dict[str, Dict[str, Any]] = {}
     phase_tracker: List[Tuple[str, datetime]] = []
 
-    with Live(console=console, refresh_per_second=max(1, int(1 / max(0.1, args.refresh)))) as live:
+    with Live(
+        console=console,
+        refresh_per_second=max(1, int(1 / max(0.1, args.refresh))),
+        vertical_overflow=args.live_overflow,
+    ) as live:
         while True:
             try:
                 am = get_custom_object(co, appmgr_name)
@@ -1272,6 +1330,8 @@ def main() -> int:
                     pod_event_cache,
                     phase_tracker,
                     pie_mode=args.pie,
+                    share_dual_tables=args.share_dual,
+                    share_max_rows=max(4, min(30, args.share_max_rows)),
                 )
             )
 
