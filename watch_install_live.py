@@ -1082,7 +1082,18 @@ def render_share_off_row(
     return wrap
 
 
-def _container_state_cn(cs: Any) -> str:
+def _max_dt(*candidates: Optional[datetime]) -> Optional[datetime]:
+    xs = [x for x in candidates if x is not None]
+    return max(xs) if xs else None
+
+
+def _fmt_dur_nonneg(sec: Optional[float]) -> str:
+    if sec is None or sec < 0:
+        return "-"
+    return fmt_dur(sec)
+
+
+def _container_state_en(cs: Any) -> str:
     if cs.state and cs.state.running:
         return "running"
     if cs.state and cs.state.waiting:
@@ -1099,16 +1110,12 @@ def _container_timing_row(
     *,
     is_init: bool,
 ) -> Tuple[int, str, List[str]]:
-    """One table row: full Chinese labels in headers; init rows show execution duration when finished."""
+    """Each column is a phase duration (or '-'); init shows wall + process execution."""
     pn = p.metadata.name or "-"
     label = f"{pn} / {cs.name}"
     kind_cn = "初始化容器" if is_init else "主容器"
 
-    state_en = _container_state_cn(cs)
-    state_cn = {"running": "运行中", "waiting": "等待中", "terminated": "已结束", "unknown": "未知"}.get(
-        state_en, "未知"
-    )
-
+    state_en = _container_state_en(cs)
     run_started: Optional[datetime] = None
     term_t: Any = None
     waiting_reason = ""
@@ -1121,70 +1128,61 @@ def _container_timing_row(
             term_t = cs.state.terminated
             waiting_reason = (term_t.reason or "") or ""
 
+    proc_start: Optional[datetime] = run_started or (
+        term_t.started_at if term_t and term_t.started_at else None
+    )
+    proc_end: Optional[datetime] = None
+    if state_en == "running" and run_started is not None:
+        proc_end = now_utc()
+    elif term_t and term_t.finished_at:
+        proc_end = term_t.finished_at
+
     ce = per_ct.get(cs.name) or {}
     pulling_first = ce.get("pulling_first")
     pulled_last = ce.get("pulled_last")
     created_first = ce.get("created_first")
     started_first = ce.get("started_first")
 
+    # Phase 1: image pull window
     pull_sec = dur_s(pulling_first, pulled_last)
-    pull_cell = fmt_dur(pull_sec) if pull_sec is not None and pull_sec > 0 else "-"
+    t_pull = _fmt_dur_nonneg(pull_sec) if pull_sec is not None and pull_sec > 0 else "-"
 
-    c_to_run = dur_s(created_first, run_started)
-    ev_to_run = dur_s(started_first, run_started)
-    c_to_run_cell = (
-        fmt_dur(c_to_run)
-        if (not is_init and c_to_run is not None and c_to_run >= 0 and run_started is not None)
-        else "-"
-    )
-    ev_to_run_cell = (
-        fmt_dur(ev_to_run)
-        if (not is_init and ev_to_run is not None and ev_to_run >= 0 and run_started is not None)
-        else "-"
-    )
+    # Phase 2: first Created event -> process start (includes wait after image)
+    t_cre_to_proc = _fmt_dur_nonneg(dur_s(created_first, proc_start))
 
-    wait_since_cre = "-"
-    if (
-        state_en != "terminated"
-        and run_started is None
-        and created_first is not None
-    ):
-        w = dur_s(created_first, now_utc())
-        if w is not None and w >= 0:
-            wait_since_cre = fmt_dur(w)
+    # Phase 3: first Started event -> process start (often short; '-' if no event)
+    t_stev_to_proc = _fmt_dur_nonneg(dur_s(started_first, proc_start))
 
-    # Actual execution duration: init finished = process time inside container; main = uptime or last exit window.
-    exec_cell = "-"
-    if is_init:
-        if term_t and term_t.started_at and term_t.finished_at:
-            ex = dur_s(term_t.started_at, term_t.finished_at)
-            if ex is not None and ex >= 0:
-                exec_cell = fmt_dur(ex)
-        elif term_t and term_t.finished_at and created_first:
-            ex = dur_s(created_first, term_t.finished_at)
-            if ex is not None and ex >= 0:
-                exec_cell = fmt_dur(ex)
-        elif state_en == "running" and run_started is not None:
-            ex = dur_s(run_started, now_utc())
-            if ex is not None and ex >= 0:
-                exec_cell = fmt_dur(ex)
-    else:
-        if state_en == "running" and run_started is not None:
-            ex = dur_s(run_started, now_utc())
-            if ex is not None and ex >= 0:
-                exec_cell = fmt_dur(ex)
-        elif term_t and term_t.started_at and term_t.finished_at:
-            ex = dur_s(term_t.started_at, term_t.finished_at)
-            if ex is not None and ex >= 0:
-                exec_cell = fmt_dur(ex)
+    # Phase 4: process running (API: running.startedAt -> now or terminated window)
+    t_proc_run = "-"
+    if proc_start and proc_end and proc_end >= proc_start:
+        t_proc_run = _fmt_dur_nonneg(dur_s(proc_start, proc_end))
+    elif proc_start and state_en == "running":
+        t_proc_run = _fmt_dur_nonneg(dur_s(proc_start, now_utc()))
 
-    last_ts = "-"
-    if run_started is not None:
-        last_ts = dt_to_iso(run_started)
-    elif term_t and term_t.finished_at:
-        last_ts = dt_to_iso(term_t.finished_at)
-    elif term_t and term_t.started_at:
-        last_ts = dt_to_iso(term_t.started_at)
+    # Phase 5: not yet in process — wall clock since last known progress anchor
+    t_stuck = "-"
+    if proc_start is None:
+        anchor = _max_dt(created_first, pulling_first, pulled_last)
+        if anchor is not None:
+            w = dur_s(anchor, now_utc())
+            if w is not None and w >= 0:
+                t_stuck = _fmt_dur_nonneg(w)
+
+    # Init only: wall clock from first Created to container end
+    t_init_wall = "-"
+    if is_init and term_t and term_t.finished_at and created_first:
+        tw = dur_s(created_first, term_t.finished_at)
+        if tw is not None and tw >= 0:
+            t_init_wall = _fmt_dur_nonneg(tw)
+
+    note = waiting_reason or "-"
+    if state_en == "waiting":
+        note = f"等待中：{note}" if note != "-" else "等待中"
+    elif state_en == "running":
+        note = f"运行中：{note}" if note != "-" else "运行中"
+    elif state_en == "terminated":
+        note = f"已结束：{note}" if note != "-" else "已结束"
 
     ready_cn = "是" if cs.ready else "否"
     img = (cs.image or "-").split("/")[-1][:56] if cs.image else "-"
@@ -1192,16 +1190,15 @@ def _container_timing_row(
     row = [
         label,
         kind_cn,
-        state_cn,
+        t_pull,
+        t_cre_to_proc,
+        t_stev_to_proc,
+        t_proc_run,
+        t_stuck,
+        t_init_wall,
         ready_cn,
         str(int(cs.restart_count or 0)),
-        pull_cell,
-        c_to_run_cell,
-        ev_to_run_cell,
-        wait_since_cre,
-        exec_cell,
-        last_ts,
-        waiting_reason or "-",
+        note,
         img,
     ]
     prio = 0
@@ -1215,21 +1212,20 @@ def _container_timing_row(
 
 
 def render_container_table(pods: List[client.V1Pod]) -> Table:
-    """Per-container table with Chinese headers; init rows show execution time when terminated."""
+    """Per-container: each column is a phase duration (seconds formatted); no standalone state column."""
     t = Table(show_header=True, header_style="bold", box=None, expand=True, pad_edge=False)
-    t.add_column("Pod 与容器名", overflow="fold", min_width=18, max_width=40)
+    t.add_column("Pod 与容器名", overflow="fold", min_width=16, max_width=40)
     t.add_column("容器类型", overflow="fold", min_width=8, max_width=12)
-    t.add_column("状态", overflow="fold", min_width=6, max_width=8)
+    t.add_column("拉镜像阶段耗时", justify="right", min_width=12, overflow="fold")
+    t.add_column("创建事件至进程开始耗时", justify="right", min_width=14, overflow="fold")
+    t.add_column("Started 事件至进程开始耗时", justify="right", min_width=14, overflow="fold")
+    t.add_column("进程内执行耗时", justify="right", min_width=12, overflow="fold")
+    t.add_column("未到进程阶段的等待耗时", justify="right", min_width=14, overflow="fold")
+    t.add_column("初始化创建至结束总耗时", justify="right", min_width=14, overflow="fold")
     t.add_column("就绪", overflow="ignore", width=4)
     t.add_column("重启次数", justify="right", width=6, overflow="ignore")
-    t.add_column("镜像拉取耗时", justify="right", min_width=12, overflow="fold")
-    t.add_column("创建事件至运行开始", justify="right", min_width=14, overflow="fold")
-    t.add_column("启动事件至运行开始", justify="right", min_width=14, overflow="fold")
-    t.add_column("创建事件至今等待", justify="right", min_width=14, overflow="fold")
-    t.add_column("实际执行耗时", justify="right", min_width=12, overflow="fold")
-    t.add_column("运行或结束时间", overflow="fold", min_width=18, max_width=24)
-    t.add_column("等待或退出说明", overflow="fold", min_width=10, max_width=28)
-    t.add_column("镜像", overflow="fold", min_width=12, max_width=40)
+    t.add_column("说明", overflow="fold", min_width=10, max_width=26)
+    t.add_column("镜像", overflow="fold", min_width=10, max_width=36)
 
     rows: List[Tuple[int, str, List[str]]] = []
     for p in pods:
@@ -1248,16 +1244,14 @@ def render_container_table(pods: List[client.V1Pod]) -> Table:
                     [
                         f"{p.metadata.name or '-'} / —",
                         "-",
-                        phase,
+                        "-",
+                        "-",
+                        "-",
+                        "-",
+                        "-",
                         "-",
                         "0",
-                        "-",
-                        "-",
-                        "-",
-                        "-",
-                        "-",
-                        "-",
-                        "尚无 containerStatuses（调度或拉镜像中）",
+                        f"尚无容器状态（Pod 阶段：{phase}）",
                         "-",
                     ],
                 )
