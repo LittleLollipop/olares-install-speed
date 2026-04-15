@@ -423,9 +423,14 @@ def build_container_event_times(
     """
     per: Dict[str, Dict[str, Optional[datetime]]] = {}
     images_to_containers: Dict[str, List[str]] = {}
-    if pod.status and pod.status.container_statuses:
-        for cs in pod.status.container_statuses:
-            per.setdefault(cs.name, {"pulling_first": None, "pulled_last": None, "created_first": None, "started_first": None})
+    for cs in list((pod.status and pod.status.container_statuses) or []) + list(
+        (pod.status and pod.status.init_container_statuses) or []
+    ):
+        per.setdefault(
+            cs.name,
+            {"pulling_first": None, "pulled_last": None, "created_first": None, "started_first": None},
+        )
+        if cs.image:
             images_to_containers.setdefault(cs.image, []).append(cs.name)
 
     def set_min(container: str, key: str, t: Optional[datetime]) -> None:
@@ -573,19 +578,19 @@ def pick_pods_for_monitor(
     if owner and app:
         loose = filter_pods(pods, app, None)
         if loose:
-            return loose, "Pods: owner label not on workloads; dropped owner filter for pod list."
+            return loose, "Pod 上无 owner 标签，已忽略 owner 条件，仅按应用名筛选。"
     if app:
         al = app.lower()
         by_name = [p for p in pods if al in (p.metadata.name or "").lower()]
         if by_name:
-            return by_name, "Pods: labels did not match --app; showing pods whose name contains the app name."
-        return pods, "Pods: labels did not match --app; showing all pods in app namespace (usually one app)."
+            return by_name, "标签与 --app 不一致，已改为按 Pod 名称包含应用名筛选。"
+        return pods, "标签与 --app 不一致，已列出该命名空间下全部 Pod（通常仅一个应用）。"
     if owner:
         ol = owner.lower()
         by_name = [p for p in pods if ol in (p.metadata.name or "").lower()]
         if by_name:
-            return by_name, "Pods: owner label missing; matched pod name."
-        return pods, "Pods: owner label missing; showing all pods in namespace."
+            return by_name, "无 owner 标签，已按 Pod 名称包含用户名筛选。"
+        return pods, "无 owner 标签，已列出该命名空间下全部 Pod。"
     return pods, ""
 
 
@@ -617,9 +622,9 @@ def update_phase_tracker(
 
 def render_phase_table(tracker: List[Tuple[str, datetime]]) -> Table:
     t = Table(show_header=True, header_style="bold", box=None, expand=True)
-    t.add_column("Phase", overflow="ignore", min_width=12)
-    t.add_column("Enter(UTC)", overflow="ignore", min_width=18)
-    t.add_column("Duration", justify="right", width=10, overflow="ignore")
+    t.add_column("阶段", overflow="ignore", min_width=12)
+    t.add_column("进入时间（UTC）", overflow="ignore", min_width=18)
+    t.add_column("持续时长", justify="right", width=10, overflow="ignore")
     now = now_utc()
     for i, (st, enter) in enumerate(tracker[-8:]):
         exit_t = tracker[i + 1][1] if i + 1 < len(tracker) else None
@@ -1077,26 +1082,160 @@ def render_share_off_row(
     return wrap
 
 
+def _container_state_cn(cs: Any) -> str:
+    if cs.state and cs.state.running:
+        return "running"
+    if cs.state and cs.state.waiting:
+        return "waiting"
+    if cs.state and cs.state.terminated:
+        return "terminated"
+    return "unknown"
+
+
+def _container_timing_row(
+    p: client.V1Pod,
+    cs: Any,
+    per_ct: Dict[str, Dict[str, Optional[datetime]]],
+    *,
+    is_init: bool,
+) -> Tuple[int, str, List[str]]:
+    """One table row: full Chinese labels in headers; init rows show execution duration when finished."""
+    pn = p.metadata.name or "-"
+    label = f"{pn} / {cs.name}"
+    kind_cn = "初始化容器" if is_init else "主容器"
+
+    state_en = _container_state_cn(cs)
+    state_cn = {"running": "运行中", "waiting": "等待中", "terminated": "已结束", "unknown": "未知"}.get(
+        state_en, "未知"
+    )
+
+    run_started: Optional[datetime] = None
+    term_t: Any = None
+    waiting_reason = ""
+    if cs.state:
+        if cs.state.running and cs.state.running.started_at:
+            run_started = cs.state.running.started_at
+        elif cs.state.waiting:
+            waiting_reason = cs.state.waiting.reason or ""
+        elif cs.state.terminated:
+            term_t = cs.state.terminated
+            waiting_reason = (term_t.reason or "") or ""
+
+    ce = per_ct.get(cs.name) or {}
+    pulling_first = ce.get("pulling_first")
+    pulled_last = ce.get("pulled_last")
+    created_first = ce.get("created_first")
+    started_first = ce.get("started_first")
+
+    pull_sec = dur_s(pulling_first, pulled_last)
+    pull_cell = fmt_dur(pull_sec) if pull_sec is not None and pull_sec > 0 else "-"
+
+    c_to_run = dur_s(created_first, run_started)
+    ev_to_run = dur_s(started_first, run_started)
+    c_to_run_cell = (
+        fmt_dur(c_to_run)
+        if (not is_init and c_to_run is not None and c_to_run >= 0 and run_started is not None)
+        else "-"
+    )
+    ev_to_run_cell = (
+        fmt_dur(ev_to_run)
+        if (not is_init and ev_to_run is not None and ev_to_run >= 0 and run_started is not None)
+        else "-"
+    )
+
+    wait_since_cre = "-"
+    if (
+        state_en != "terminated"
+        and run_started is None
+        and created_first is not None
+    ):
+        w = dur_s(created_first, now_utc())
+        if w is not None and w >= 0:
+            wait_since_cre = fmt_dur(w)
+
+    # Actual execution duration: init finished = process time inside container; main = uptime or last exit window.
+    exec_cell = "-"
+    if is_init:
+        if term_t and term_t.started_at and term_t.finished_at:
+            ex = dur_s(term_t.started_at, term_t.finished_at)
+            if ex is not None and ex >= 0:
+                exec_cell = fmt_dur(ex)
+        elif term_t and term_t.finished_at and created_first:
+            ex = dur_s(created_first, term_t.finished_at)
+            if ex is not None and ex >= 0:
+                exec_cell = fmt_dur(ex)
+        elif state_en == "running" and run_started is not None:
+            ex = dur_s(run_started, now_utc())
+            if ex is not None and ex >= 0:
+                exec_cell = fmt_dur(ex)
+    else:
+        if state_en == "running" and run_started is not None:
+            ex = dur_s(run_started, now_utc())
+            if ex is not None and ex >= 0:
+                exec_cell = fmt_dur(ex)
+        elif term_t and term_t.started_at and term_t.finished_at:
+            ex = dur_s(term_t.started_at, term_t.finished_at)
+            if ex is not None and ex >= 0:
+                exec_cell = fmt_dur(ex)
+
+    last_ts = "-"
+    if run_started is not None:
+        last_ts = dt_to_iso(run_started)
+    elif term_t and term_t.finished_at:
+        last_ts = dt_to_iso(term_t.finished_at)
+    elif term_t and term_t.started_at:
+        last_ts = dt_to_iso(term_t.started_at)
+
+    ready_cn = "是" if cs.ready else "否"
+    img = (cs.image or "-").split("/")[-1][:56] if cs.image else "-"
+
+    row = [
+        label,
+        kind_cn,
+        state_cn,
+        ready_cn,
+        str(int(cs.restart_count or 0)),
+        pull_cell,
+        c_to_run_cell,
+        ev_to_run_cell,
+        wait_since_cre,
+        exec_cell,
+        last_ts,
+        waiting_reason or "-",
+        img,
+    ]
+    prio = 0
+    if state_en == "waiting":
+        prio = 0
+    elif not cs.ready:
+        prio = 1
+    else:
+        prio = 2
+    return prio, label, row
+
+
 def render_container_table(pods: List[client.V1Pod]) -> Table:
+    """Per-container table with Chinese headers; init rows show execution time when terminated."""
     t = Table(show_header=True, header_style="bold", box=None, expand=True, pad_edge=False)
-    t.add_column("Pod/Ctr", overflow="ignore", min_width=16, max_width=34)
-    t.add_column("St", overflow="ignore", width=8)
-    t.add_column("Rd", overflow="ignore", width=3)
-    t.add_column("Rst", justify="right", width=4, overflow="ignore")
-    t.add_column("Pl+", justify="right", width=7, overflow="ignore")
-    t.add_column("Cre", overflow="ignore", min_width=16, max_width=20)
-    t.add_column("SEv", overflow="ignore", min_width=16, max_width=20)
-    t.add_column("SAt", overflow="ignore", min_width=16, max_width=20)
-    t.add_column("Wait", overflow="ignore", min_width=10, max_width=18)
-    t.add_column("Image", overflow="ignore", min_width=12, max_width=40)
+    t.add_column("Pod 与容器名", overflow="fold", min_width=18, max_width=40)
+    t.add_column("容器类型", overflow="fold", min_width=8, max_width=12)
+    t.add_column("状态", overflow="fold", min_width=6, max_width=8)
+    t.add_column("就绪", overflow="ignore", width=4)
+    t.add_column("重启次数", justify="right", width=6, overflow="ignore")
+    t.add_column("镜像拉取耗时", justify="right", min_width=12, overflow="fold")
+    t.add_column("创建事件至运行开始", justify="right", min_width=14, overflow="fold")
+    t.add_column("启动事件至运行开始", justify="right", min_width=14, overflow="fold")
+    t.add_column("创建事件至今等待", justify="right", min_width=14, overflow="fold")
+    t.add_column("实际执行耗时", justify="right", min_width=12, overflow="fold")
+    t.add_column("运行或结束时间", overflow="fold", min_width=18, max_width=24)
+    t.add_column("等待或退出说明", overflow="fold", min_width=10, max_width=28)
+    t.add_column("镜像", overflow="fold", min_width=12, max_width=40)
 
     rows: List[Tuple[int, str, List[str]]] = []
     for p in pods:
         if not p.status:
             continue
 
-        # Best-effort per-container event times (requires events embedded in pod annotations cache upstream).
-        # Caller may attach a precomputed map on pod object dynamically; otherwise blank.
         per_ct: Dict[str, Dict[str, Optional[datetime]]] = getattr(p, "_per_container_event_times", {})  # type: ignore[attr-defined]
 
         cstat = p.status.container_statuses
@@ -1107,15 +1246,18 @@ def render_container_table(pods: List[client.V1Pod]) -> Table:
                     0,
                     p.metadata.name or "-",
                     [
-                        f"{p.metadata.name or '-'}/—",
+                        f"{p.metadata.name or '-'} / —",
+                        "-",
                         phase,
-                        "?",
+                        "-",
                         "0",
                         "-",
                         "-",
                         "-",
                         "-",
-                        "no containerStatuses yet (scheduling/pulling?)",
+                        "-",
+                        "-",
+                        "尚无 containerStatuses（调度或拉镜像中）",
                         "-",
                     ],
                 )
@@ -1123,51 +1265,12 @@ def render_container_table(pods: List[client.V1Pod]) -> Table:
             continue
 
         for cs in cstat:
-            state = "-"
-            started_at: Optional[datetime] = None
-            waiting_reason = ""
-            if cs.state:
-                if cs.state.running and cs.state.running.started_at:
-                    state = "running"
-                    started_at = cs.state.running.started_at
-                elif cs.state.waiting:
-                    state = "waiting"
-                    waiting_reason = cs.state.waiting.reason or ""
-                elif cs.state.terminated:
-                    state = "terminated"
-                    waiting_reason = cs.state.terminated.reason or ""
+            rows.append(_container_timing_row(p, cs, per_ct, is_init=False))
 
-            ce = per_ct.get(cs.name) or {}
-            pulling_first = ce.get("pulling_first")
-            pulled_last = ce.get("pulled_last")
-            created_first = ce.get("created_first")
-            started_first = ce.get("started_first")
-            pull_d = fmt_dur(dur_s(pulling_first, pulled_last))
+        for cs in (p.status.init_container_statuses or []):
+            rows.append(_container_timing_row(p, cs, per_ct, is_init=True))
 
-            key = f"{p.metadata.name}/{cs.name}"
-            row = [
-                key,
-                state,
-                "Y" if cs.ready else "N",
-                str(int(cs.restart_count or 0)),
-                pull_d,
-                dt_to_iso(created_first),
-                dt_to_iso(started_first),
-                dt_to_iso(started_at),
-                waiting_reason or "-",
-                cs.image or "-",
-            ]
-            # Sort: waiting first, then not ready, then stable
-            prio = 0
-            if state == "waiting":
-                prio = 0
-            elif not cs.ready:
-                prio = 1
-            else:
-                prio = 2
-            rows.append((prio, key, row))
-
-    for _, _, r in sorted(rows, key=lambda x: (x[0], x[1]))[:60]:
+    for _, _, r in sorted(rows, key=lambda x: (x[0], x[1]))[:80]:
         t.add_row(*r)
     return t
 
@@ -1212,26 +1315,26 @@ def render(
     share_bar_width: int = 28,
 ) -> Table:
     root = Table(
-        title=f"Install Live Monitor  appmgr={appmgr_name}  ns={namespace}",
+        title=f"安装实时监控  appmgr={appmgr_name}  命名空间={namespace}",
         show_lines=False,
         expand=True,
     )
-    root.add_column("Section", style="bold", width=12, overflow="ignore", no_wrap=True)
-    root.add_column("Details", overflow="fold", no_wrap=False)
+    root.add_column("区块", style="bold", width=14, overflow="ignore", no_wrap=True)
+    root.add_column("内容", overflow="fold", no_wrap=False)
 
     elapsed = dur_s(started_at, now_utc())
     am_line = Text()
-    am_line.append(f"state={am_state}  progress={am_progress}  elapsed={fmt_dur(elapsed)}\n")
-    am_line.append(f"statusTime={dt_to_iso(am_time)}\n")
-    am_line.append(f"message={am_msg}")
-    root.add_row("ApplicationManager", am_line)
-    root.add_row("Phases", render_phase_table(phase_tracker))
+    am_line.append(f"状态={am_state}  进度={am_progress}  已运行={fmt_dur(elapsed)}\n")
+    am_line.append(f"状态时间={dt_to_iso(am_time)}\n")
+    am_line.append(f"消息={am_msg}")
+    root.add_row("应用管理器", am_line)
+    root.add_row("阶段", render_phase_table(phase_tracker))
     if pie_mode == "off":
-        root.add_row("Share", render_share_off_row(phase_tracker, pods, pod_event_cache, started_at))
+        root.add_row("占比", render_share_off_row(phase_tracker, pods, pod_event_cache, started_at))
     elif pie_mode == "full":
-        root.add_row("Phase share", render_phase_pie(phase_tracker, radius=8, max_legend_rows=14))
+        root.add_row("阶段占比", render_phase_pie(phase_tracker, radius=8, max_legend_rows=14))
         root.add_row(
-            "Pod share",
+            "Pod 占比",
             render_pod_track_pie(
                 pods,
                 pod_event_cache,
@@ -1241,7 +1344,7 @@ def render(
             ),
         )
         root.add_row(
-            "Ctr pull",
+            "容器拉取占比",
             render_container_pull_pie(
                 pods,
                 pod_event_cache,
@@ -1250,10 +1353,10 @@ def render(
             ),
         )
     elif pie_mode == "compact":
-        root.add_row("Share", render_share_compact_row(phase_tracker, pods, pod_event_cache, started_at))
+        root.add_row("占比", render_share_compact_row(phase_tracker, pods, pod_event_cache, started_at))
     else:
         root.add_row(
-            "Share",
+            "占比",
             render_share_bars_block(
                 phase_tracker,
                 pods,
@@ -1265,15 +1368,15 @@ def render(
         )
 
     pods_tbl = Table(show_header=True, header_style="bold", box=None, expand=True, pad_edge=False)
-    pods_tbl.add_column("Pod", overflow="ignore", min_width=14, max_width=36)
-    pods_tbl.add_column("Node", overflow="ignore", min_width=6, max_width=14)
-    pods_tbl.add_column("Ph", overflow="ignore", width=7)
-    pods_tbl.add_column("Sch+", justify="right", overflow="ignore", width=7)
-    pods_tbl.add_column("Pl+", justify="right", overflow="ignore", width=7)
-    pods_tbl.add_column("S→R+", justify="right", overflow="ignore", width=7)
-    pods_tbl.add_column("Warn", overflow="ignore", min_width=8, max_width=22)
-    pods_tbl.add_column("Msg", overflow="ignore", min_width=10, max_width=32)
-    pods_tbl.add_column("Ctr", overflow="ignore", min_width=10, max_width=28)
+    pods_tbl.add_column("Pod 名称", overflow="ignore", min_width=14, max_width=36)
+    pods_tbl.add_column("节点", overflow="ignore", min_width=6, max_width=14)
+    pods_tbl.add_column("Pod 阶段", overflow="ignore", width=10)
+    pods_tbl.add_column("调度耗时", justify="right", overflow="fold", min_width=8)
+    pods_tbl.add_column("拉镜像耗时", justify="right", overflow="fold", min_width=8)
+    pods_tbl.add_column("启动至就绪耗时", justify="right", overflow="fold", min_width=10)
+    pods_tbl.add_column("告警摘要", overflow="ignore", min_width=8, max_width=22)
+    pods_tbl.add_column("告警详情", overflow="ignore", min_width=10, max_width=32)
+    pods_tbl.add_column("容器概况", overflow="ignore", min_width=10, max_width=28)
 
     for p in sorted(pods, key=lambda x: (x.metadata.creation_timestamp or started_at)):
         created = p.metadata.creation_timestamp
@@ -1296,20 +1399,20 @@ def render(
         start_ready_d = fmt_dur(dur_s(started_ev, ready))
 
         running_ct, total_ct, waiting_ct, latest_started_at, worst_wait_reason = summarize_pod_containers(p)
-        c_line = f"running {running_ct}/{total_ct}"
+        c_line = f"运行中 {running_ct} / 共 {total_ct} 个主容器"
         if waiting_ct > 0:
-            c_line += f"  waiting={waiting_ct}"
+            c_line += f"，等待中 {waiting_ct} 个"
             if worst_wait_reason:
-                c_line += f"({worst_wait_reason})"
+                c_line += f"（{worst_wait_reason}）"
         if latest_started_at:
-            c_line += f"  latestStartedAt={dt_to_iso(latest_started_at)}"
+            c_line += f"；最近进入运行 {dt_to_iso(latest_started_at)}"
 
         warn_cell = "-"
         if warn_reason:
             first = warn_first_by_reason.get(warn_reason)
             since = fmt_dur(dur_s(first, now_utc())) if first else "-"
             age = fmt_dur(dur_s(warn_time, now_utc())) if warn_time else "-"
-            warn_cell = f"{warn_reason} since={since} last={age}"
+            warn_cell = f"{warn_reason}，首次距今 {since}，最近事件距今 {age}"
 
         warn_msg_cell = "-"
         if warn_msg:
@@ -1332,8 +1435,8 @@ def render(
     pods_panel: Any = pods_tbl
     if pod_filter_hint:
         pods_panel = Group(Text(pod_filter_hint, style="dim"), pods_tbl)
-    root.add_row("Pods", pods_panel)
-    root.add_row("Containers", render_container_table(pods))
+    root.add_row("Pod 列表", pods_panel)
+    root.add_row("容器列表", render_container_table(pods))
     return root
 
 
