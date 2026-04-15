@@ -38,19 +38,14 @@ pip install -r requirements.txt
 python speed/watch_install_live.py --app <app-name> --wait-new-install --refresh 1.0
 ```
 
-安装完成后可自动退出：
-
-```bash
-python speed/watch_install_live.py --app <app-name> --refresh 1.0 --until-running
-```
+**默认行为**：`ApplicationManager` 状态变为 **`Running` 后自动退出**（打印 `DONE`）。若要在进入 Running 后仍持续刷新直到手动 `Ctrl+C`，请加 **`--follow`**。
 
 #### 2）已知 `ApplicationManager` 名字（立刻跟一条 CR）
 
 ```bash
 python speed/watch_install_live.py \
   --appmgr <applicationmanager-name> \
-  --refresh 1.0 \
-  --until-running
+  --refresh 1.0
 ```
 
 #### 3）Web / 非 TTY / Olares 嵌套终端
@@ -76,7 +71,7 @@ python speed/watch_install_live.py --app <app-name> --wait-new-install --refresh
 - **应用管理器**：状态、进度、已运行时长、状态时间、消息（中文标签）。
 - **阶段**：各状态进入时间（UTC）与持续时长。
 - **Pod 列表**：节点、Pod 阶段、调度耗时、拉镜像耗时、启动至就绪耗时、告警（中文摘要）；筛选回退时有一行灰色中文说明。
-- **容器列表**：表头为**完整中文**；区分**主容器 / 初始化容器**。初始化容器在**已结束**时，**实际执行耗时**为进程内运行时长（`terminated.startedAt`→`finishedAt`，缺省时用创建至结束近似）；主容器**运行中**时为自进入运行至今的时长。另有镜像拉取耗时、创建至运行开始、启动事件至运行开始、创建事件至今等待（仅未结束时）等列。
+- **容器列表**：表头为**完整中文**；区分**主容器 / 初始化容器**。列为 **调度耗时**（Pod `creationTimestamp`→`PodScheduled=True`，同一 Pod 各行相同）、**调度完成至进程开始**（已调度→本容器进程起点；若尚未开始进程则为自调度起已等待时长）、**进程执行耗时**（对**初始化容器**即初始化脚本实际运行时长；主容器为业务进程时长；部分 CRI 缺 `startedAt` 时会用 `Pod.startTime` 近似）。
 
 完整参数：
 
@@ -173,7 +168,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 # 若仓库根目录即本目录（无 speed/ 前缀）：
-python watch_install_live.py --app <app-name> --refresh 1.0 --until-running
+python watch_install_live.py --app <app-name> --refresh 1.0
 
 python collect_install_timeline.py \
   --appmgr <applicationmanager-name> \

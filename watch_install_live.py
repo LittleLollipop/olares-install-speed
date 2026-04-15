@@ -1082,9 +1082,18 @@ def render_share_off_row(
     return wrap
 
 
-def _max_dt(*candidates: Optional[datetime]) -> Optional[datetime]:
-    xs = [x for x in candidates if x is not None]
-    return max(xs) if xs else None
+def merge_pod_pull_into_per_container(
+    per: Dict[str, Dict[str, Optional[datetime]]],
+    pod_pulling_first: Optional[datetime],
+    pod_pulled_last: Optional[datetime],
+) -> None:
+    """When per-container Pulling/Pulled events are gone (TTL), reuse pod-level pull window."""
+    if not pod_pulling_first or not pod_pulled_last:
+        return
+    for m in per.values():
+        if m.get("pulling_first") is None and m.get("pulled_last") is None:
+            m["pulling_first"] = pod_pulling_first
+            m["pulled_last"] = pod_pulled_last
 
 
 def _fmt_dur_nonneg(sec: Optional[float]) -> str:
@@ -1106,11 +1115,10 @@ def _container_state_en(cs: Any) -> str:
 def _container_timing_row(
     p: client.V1Pod,
     cs: Any,
-    per_ct: Dict[str, Dict[str, Optional[datetime]]],
     *,
     is_init: bool,
 ) -> Tuple[int, str, List[str]]:
-    """Each column is a phase duration (or '-'); init shows wall + process execution."""
+    """Scheduling (pod-level), queue after schedule, and process execution (init = init script run)."""
     pn = p.metadata.name or "-"
     label = f"{pn} / {cs.name}"
     kind_cn = "初始化容器" if is_init else "主容器"
@@ -1128,53 +1136,57 @@ def _container_timing_row(
             term_t = cs.state.terminated
             waiting_reason = (term_t.reason or "") or ""
 
+    created = p.metadata.creation_timestamp if p.metadata else None
+    scheduled_at = pod_time_from_condition(p, "PodScheduled", "True")
+    anchor_init = (p.status.start_time if p.status else None) or created
+
     proc_start: Optional[datetime] = run_started or (
         term_t.started_at if term_t and term_t.started_at else None
     )
+    # Some CRI / platforms omit container startedAt while state is Running — approximate with pod start.
+    if proc_start is None and state_en == "running":
+        ps = p.status.start_time if p.status else None
+        if ps is not None:
+            proc_start = ps
+            run_started = ps
+
     proc_end: Optional[datetime] = None
     if state_en == "running" and run_started is not None:
         proc_end = now_utc()
     elif term_t and term_t.finished_at:
         proc_end = term_t.finished_at
 
-    ce = per_ct.get(cs.name) or {}
-    pulling_first = ce.get("pulling_first")
-    pulled_last = ce.get("pulled_last")
-    created_first = ce.get("created_first")
-    started_first = ce.get("started_first")
+    # Terminated but API omitted startedAt: wall from anchor to exit (best-effort).
+    if (
+        proc_start is None
+        and term_t
+        and term_t.finished_at
+        and anchor_init
+        and anchor_init <= term_t.finished_at
+    ):
+        proc_start = anchor_init
 
-    # Phase 1: image pull window
-    pull_sec = dur_s(pulling_first, pulled_last)
-    t_pull = _fmt_dur_nonneg(pull_sec) if pull_sec is not None and pull_sec > 0 else "-"
+    # Pod-level: creation -> bound/scheduled (same value for every container row in this pod).
+    t_sched = "-"
+    if created and scheduled_at:
+        t_sched = _fmt_dur_nonneg(dur_s(created, scheduled_at))
+    elif created and not scheduled_at and (p.status.phase or "") == "Pending":
+        t_sched = _fmt_dur_nonneg(dur_s(created, now_utc()))
 
-    # Phase 2: first Created event -> process start (includes wait after image)
-    t_cre_to_proc = _fmt_dur_nonneg(dur_s(created_first, proc_start))
+    # After pod is scheduled: until this container's process starts (or elapsed wait if not started yet).
+    t_after_sched = "-"
+    if scheduled_at:
+        if proc_start is not None:
+            t_after_sched = _fmt_dur_nonneg(dur_s(scheduled_at, proc_start))
+        else:
+            t_after_sched = _fmt_dur_nonneg(dur_s(scheduled_at, now_utc()))
 
-    # Phase 3: first Started event -> process start (often short; '-' if no event)
-    t_stev_to_proc = _fmt_dur_nonneg(dur_s(started_first, proc_start))
-
-    # Phase 4: process running (API: running.startedAt -> now or terminated window)
+    # Process execution: for init containers this is "how long the init step ran".
     t_proc_run = "-"
     if proc_start and proc_end and proc_end >= proc_start:
         t_proc_run = _fmt_dur_nonneg(dur_s(proc_start, proc_end))
     elif proc_start and state_en == "running":
         t_proc_run = _fmt_dur_nonneg(dur_s(proc_start, now_utc()))
-
-    # Phase 5: not yet in process — wall clock since last known progress anchor
-    t_stuck = "-"
-    if proc_start is None:
-        anchor = _max_dt(created_first, pulling_first, pulled_last)
-        if anchor is not None:
-            w = dur_s(anchor, now_utc())
-            if w is not None and w >= 0:
-                t_stuck = _fmt_dur_nonneg(w)
-
-    # Init only: wall clock from first Created to container end
-    t_init_wall = "-"
-    if is_init and term_t and term_t.finished_at and created_first:
-        tw = dur_s(created_first, term_t.finished_at)
-        if tw is not None and tw >= 0:
-            t_init_wall = _fmt_dur_nonneg(tw)
 
     note = waiting_reason or "-"
     if state_en == "waiting":
@@ -1190,12 +1202,9 @@ def _container_timing_row(
     row = [
         label,
         kind_cn,
-        t_pull,
-        t_cre_to_proc,
-        t_stev_to_proc,
+        t_sched,
+        t_after_sched,
         t_proc_run,
-        t_stuck,
-        t_init_wall,
         ready_cn,
         str(int(cs.restart_count or 0)),
         note,
@@ -1212,16 +1221,13 @@ def _container_timing_row(
 
 
 def render_container_table(pods: List[client.V1Pod]) -> Table:
-    """Per-container: each column is a phase duration (seconds formatted); no standalone state column."""
+    """Per-container: pod schedule latency, post-schedule queue, process run (init = init script duration)."""
     t = Table(show_header=True, header_style="bold", box=None, expand=True, pad_edge=False)
     t.add_column("Pod 与容器名", overflow="fold", min_width=16, max_width=40)
     t.add_column("容器类型", overflow="fold", min_width=8, max_width=12)
-    t.add_column("拉镜像阶段耗时", justify="right", min_width=12, overflow="fold")
-    t.add_column("创建事件至进程开始耗时", justify="right", min_width=14, overflow="fold")
-    t.add_column("Started 事件至进程开始耗时", justify="right", min_width=14, overflow="fold")
-    t.add_column("进程内执行耗时", justify="right", min_width=12, overflow="fold")
-    t.add_column("未到进程阶段的等待耗时", justify="right", min_width=14, overflow="fold")
-    t.add_column("初始化创建至结束总耗时", justify="right", min_width=14, overflow="fold")
+    t.add_column("调度耗时", justify="right", min_width=10, overflow="fold")
+    t.add_column("调度完成至进程开始", justify="right", min_width=14, overflow="fold")
+    t.add_column("进程执行耗时", justify="right", min_width=12, overflow="fold")
     t.add_column("就绪", overflow="ignore", width=4)
     t.add_column("重启次数", justify="right", width=6, overflow="ignore")
     t.add_column("说明", overflow="fold", min_width=10, max_width=26)
@@ -1231,8 +1237,6 @@ def render_container_table(pods: List[client.V1Pod]) -> Table:
     for p in pods:
         if not p.status:
             continue
-
-        per_ct: Dict[str, Dict[str, Optional[datetime]]] = getattr(p, "_per_container_event_times", {})  # type: ignore[attr-defined]
 
         cstat = p.status.container_statuses
         if not cstat:
@@ -1248,8 +1252,6 @@ def render_container_table(pods: List[client.V1Pod]) -> Table:
                         "-",
                         "-",
                         "-",
-                        "-",
-                        "-",
                         "0",
                         f"尚无容器状态（Pod 阶段：{phase}）",
                         "-",
@@ -1259,10 +1261,10 @@ def render_container_table(pods: List[client.V1Pod]) -> Table:
             continue
 
         for cs in cstat:
-            rows.append(_container_timing_row(p, cs, per_ct, is_init=False))
+            rows.append(_container_timing_row(p, cs, is_init=False))
 
         for cs in (p.status.init_container_statuses or []):
-            rows.append(_container_timing_row(p, cs, per_ct, is_init=True))
+            rows.append(_container_timing_row(p, cs, is_init=True))
 
     for _, _, r in sorted(rows, key=lambda x: (x[0], x[1]))[:80]:
         t.add_row(*r)
@@ -1475,6 +1477,7 @@ def monitor_refresh_tick(
         pulled_last = find_last_event_time(evs, "Pulled")
         started_ev = find_first_event_time(evs, "Started")
         per_container = build_container_event_times(evs, p)
+        merge_pod_pull_into_per_container(per_container, pulling_first, pulled_last)
         warn = summarize_warning(evs)
 
         setattr(p, "_per_container_event_times", per_container)
@@ -1514,7 +1517,11 @@ def main() -> int:
     ap.add_argument("--app", help="App name (arming mode: start before install and wait for appmgr)")
     ap.add_argument("--owner", help="Owner username (optional, improves pod filtering)")
     ap.add_argument("--refresh", type=float, default=1.0, help="Refresh interval seconds (default 1.0)")
-    ap.add_argument("--until-running", action="store_true", help="Exit when appmgr state becomes Running")
+    ap.add_argument(
+        "--follow",
+        action="store_true",
+        help="Keep monitoring after ApplicationManager is Running (default: exit when state is Running)",
+    )
     ap.add_argument(
         "--wait-new-install",
         action="store_true",
@@ -1634,7 +1641,7 @@ def main() -> int:
                 )
                 console.clear()
                 console.print(frame)
-                if args.until_running and am_state.lower() == "running":
+                if not args.follow and am_state.strip().lower() == "running":
                     break
             except Exception as e:
                 print(f"[install-speed] monitor loop error: {e}", file=sys.stderr)
@@ -1662,7 +1669,7 @@ def main() -> int:
                     )
                     live.update(frame)
 
-                    if args.until_running and am_state.lower() == "running":
+                    if not args.follow and am_state.strip().lower() == "running":
                         break
 
                 except Exception as e:
@@ -1671,7 +1678,8 @@ def main() -> int:
 
                 time.sleep(args.refresh)
 
-    console.print("[green]DONE[/green] appmgr reached Running" if args.until_running else "DONE")
+    if not args.follow:
+        console.print("[green]DONE[/green] ApplicationManager is Running; monitor exited.")
     return 0
 
 
